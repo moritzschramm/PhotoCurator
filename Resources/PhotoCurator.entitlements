@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Sandbox (spec §9). A free Apple ID / ad-hoc signature is enough to run
+	     this locally; Developer ID / notarization is only needed to distribute. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- The two persisted folder grants (photo library, export target) — both need
+	     write access: the live DB's VACUUM INTO snapshot and SD imports write into
+	     the photo folder, exports write into the export folder. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+
+	<!-- Lets the security-scoped bookmarks created for those two folders keep
+	     resolving across app launches. -->
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
+
+	<!-- SD card / camera card reader access, resolved at first read rather than a
+	     first-run folder grant (spec §9). NOTE: verify this exact key against
+	     current Apple documentation before shipping — Apple's entitlement key
+	     reference for less-common keys like this one changes over time and this
+	     could not be independently re-verified against a live docs page while
+	     generating this file (see accompanying README caveat). -->
+	<key>com.apple.security.files.removable-media.read-only</key>
+	<true/>
+</dict>
+</plist>

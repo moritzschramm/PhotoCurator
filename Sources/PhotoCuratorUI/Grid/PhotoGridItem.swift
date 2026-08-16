@@ -1,0 +1,133 @@
+import AppKit
+import PhotoCuratorCore
+
+/// One grid tile. Plain AppKit view built programmatically (no XIB): a thumbnail,
+/// a filename fallback + cloud badge for online-only-and-underived shots, and a
+/// lifecycle badge — candidate/published highlighted, rejected dimmed but still
+/// visible, never hidden (spec §6, §8).
+final class PhotoGridItem: NSCollectionViewItem {
+    static let identifier = NSUserInterfaceItemIdentifier("PhotoGridItem")
+    private static let imageCache = NSCache<NSString, NSImage>()
+
+    private let thumbnailImageView = NSImageView()
+    private let filenameLabel = NSTextField(labelWithString: "")
+    private let cloudBadge = NSImageView()
+    private let stateBadge = NSImageView()
+    private var currentThumbnailPath: String?
+
+    override func loadView() {
+        let container = NSView()
+        container.wantsLayer = true
+        view = container
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupViews()
+    }
+
+    private func setupViews() {
+        thumbnailImageView.imageScaling = .scaleProportionallyUpOrDown
+        thumbnailImageView.wantsLayer = true
+        thumbnailImageView.layer?.cornerRadius = 6
+        thumbnailImageView.layer?.masksToBounds = true
+        thumbnailImageView.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+        thumbnailImageView.translatesAutoresizingMaskIntoConstraints = false
+
+        filenameLabel.font = .systemFont(ofSize: 10)
+        filenameLabel.textColor = .white
+        filenameLabel.alignment = .center
+        filenameLabel.lineBreakMode = .byTruncatingMiddle
+        filenameLabel.drawsBackground = false
+        filenameLabel.isBordered = false
+        filenameLabel.isEditable = false
+        filenameLabel.isHidden = true
+        filenameLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        cloudBadge.image = NSImage(systemSymbolName: "icloud", accessibilityDescription: "Online only")
+        cloudBadge.contentTintColor = .white
+        cloudBadge.isHidden = true
+        cloudBadge.translatesAutoresizingMaskIntoConstraints = false
+
+        stateBadge.isHidden = true
+        stateBadge.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(thumbnailImageView)
+        view.addSubview(filenameLabel)
+        view.addSubview(cloudBadge)
+        view.addSubview(stateBadge)
+
+        NSLayoutConstraint.activate([
+            thumbnailImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            thumbnailImageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            thumbnailImageView.topAnchor.constraint(equalTo: view.topAnchor),
+            thumbnailImageView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            filenameLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+            filenameLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+            filenameLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4),
+
+            cloudBadge.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
+            cloudBadge.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+            cloudBadge.widthAnchor.constraint(equalToConstant: 16),
+            cloudBadge.heightAnchor.constraint(equalToConstant: 16),
+
+            stateBadge.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
+            stateBadge.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+            stateBadge.widthAnchor.constraint(equalToConstant: 16),
+            stateBadge.heightAnchor.constraint(equalToConstant: 16)
+        ])
+    }
+
+    func configure(with entry: PhotoGridEntry) {
+        let pwr = entry.photo
+
+        if let path = entry.gridThumbnailPath {
+            currentThumbnailPath = path
+            if let cached = Self.imageCache.object(forKey: path as NSString) {
+                thumbnailImageView.image = cached
+            } else if let loaded = NSImage(contentsOfFile: path) {
+                Self.imageCache.setObject(loaded, forKey: path as NSString)
+                thumbnailImageView.image = loaded
+            } else {
+                thumbnailImageView.image = nil
+            }
+        } else {
+            currentThumbnailPath = nil
+            thumbnailImageView.image = nil
+        }
+
+        let showsCloudBadge = pwr.isFullyOnlineOnly && !pwr.hasAnyDerivedRepresentation
+        cloudBadge.isHidden = !showsCloudBadge
+        filenameLabel.isHidden = entry.gridThumbnailPath != nil
+        filenameLabel.stringValue = pwr.jpg?.filename ?? pwr.raw?.filename ?? pwr.photo.basename
+
+        switch pwr.photo.lifecycleState {
+        case .candidate:
+            stateBadge.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Candidate")
+            stateBadge.contentTintColor = .systemYellow
+            stateBadge.isHidden = false
+        case .published:
+            stateBadge.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Published")
+            stateBadge.contentTintColor = .systemGreen
+            stateBadge.isHidden = false
+        case .rejected:
+            stateBadge.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Rejected")
+            stateBadge.contentTintColor = .systemRed
+            stateBadge.isHidden = false
+        case .new, .reviewed:
+            stateBadge.isHidden = true
+        }
+
+        // Rejected photos are shown, not hidden — just visually deemphasized.
+        view.alphaValue = pwr.photo.lifecycleState == .rejected ? 0.45 : 1.0
+    }
+
+    override var isSelected: Bool {
+        didSet {
+            view.layer?.borderWidth = isSelected ? 3 : 0
+            view.layer?.borderColor = NSColor.controlAccentColor.cgColor
+            view.layer?.cornerRadius = 6
+        }
+    }
+}
