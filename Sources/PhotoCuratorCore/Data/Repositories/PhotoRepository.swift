@@ -11,18 +11,37 @@ public enum PhotoRepository {
 
     /// All photos, newest capture date first, joined with their representations.
     /// Two plain queries + in-memory grouping rather than a GRDB association fetch,
-    /// so the shape of the result is easy to reason about and test.
-    public static func fetchAllPhotosWithRepresentations(_ db: Database) throws -> [PhotoWithRepresentations] {
-        let photos = try Photo
-            .order(Photo.Columns.captureDate.desc, Photo.Columns.basename.asc, Photo.Columns.id.asc)
-            .fetchAll(db)
+    /// so the shape of the result is easy to reason about and test. `libraryId: nil`
+    /// (the default) means every registered library, matching the grid's "All
+    /// Libraries" filter; a specific id scopes to just that one.
+    public static func fetchAllPhotosWithRepresentations(_ db: Database, libraryId: Int64? = nil) throws -> [PhotoWithRepresentations] {
+        var request = Photo.order(Photo.Columns.captureDate.desc, Photo.Columns.basename.asc, Photo.Columns.id.asc)
+        if let libraryId {
+            request = request.filter(Photo.Columns.libraryId == libraryId)
+        }
+        let photos = try request.fetchAll(db)
         return try attachRepresentations(to: photos, db)
     }
 
     /// All photos with their best-available cached grid thumbnail already attached,
     /// so the grid never needs a per-cell database query while scrolling.
-    public static func fetchGridEntries(_ db: Database) throws -> [PhotoGridEntry] {
-        try attachGridThumbnails(to: fetchAllPhotosWithRepresentations(db), db)
+    public static func fetchGridEntries(_ db: Database, libraryId: Int64? = nil) throws -> [PhotoGridEntry] {
+        try attachGridThumbnails(to: fetchAllPhotosWithRepresentations(db, libraryId: libraryId), db)
+    }
+
+    /// Photos that have been reviewed (accepted or candidate — rejected and
+    /// never-reviewed photos don't belong here) but don't yet belong to any album —
+    /// the "Unassigned Photos" surface for filing reviewed photos into a category.
+    /// Global across every registered library, matching "All Albums".
+    public static func fetchUnassignedGridEntries(_ db: Database) throws -> [PhotoGridEntry] {
+        let reviewedStates = [LifecycleState.accepted.rawValue, LifecycleState.candidate.rawValue]
+        let assignedPhotoIds = try Int64.fetchSet(db, sql: "SELECT DISTINCT photo_id FROM photo_albums")
+        let photos = try Photo
+            .filter(reviewedStates.contains(Photo.Columns.lifecycleState))
+            .filter(!assignedPhotoIds.contains(Photo.Columns.id))
+            .order(Photo.Columns.captureDate.desc, Photo.Columns.basename.asc, Photo.Columns.id.asc)
+            .fetchAll(db)
+        return try attachGridThumbnails(to: attachRepresentations(to: photos, db), db)
     }
 
     /// Same idea, scoped to an already-fetched photo list (e.g. one album's photos).
@@ -57,10 +76,20 @@ public enum PhotoRepository {
         return PhotoWithRepresentations(photo: photo, representations: reps)
     }
 
-    public static func findPhoto(basename: String, sourceDir: String, in db: Database) throws -> Photo? {
+    public static func findPhoto(libraryId: Int64, basename: String, sourceDir: String, in db: Database) throws -> Photo? {
         try Photo
+            .filter(Photo.Columns.libraryId == libraryId)
             .filter(Photo.Columns.basename == basename && Photo.Columns.sourceDir == sourceDir)
             .fetchOne(db)
+    }
+
+    /// Whether `libraryId` already has any photo sitting directly in its root
+    /// (`source_dir == ""`) — drives auto-detecting a flat import (no per-camera
+    /// subdirectory) when importing into a library that's already organized that way.
+    public static func libraryHasRootLevelPhotos(libraryId: Int64, in db: Database) throws -> Bool {
+        try Photo
+            .filter(Photo.Columns.libraryId == libraryId && Photo.Columns.sourceDir == "")
+            .fetchCount(db) > 0
     }
 
     public static func representations(photoId: Int64, in db: Database) throws -> [Representation] {
@@ -121,13 +150,14 @@ public enum PhotoRepository {
     /// is the first representation ever seen for that shot. Never duplicates (spec §5).
     @discardableResult
     public static func upsertPhoto(
+        libraryId: Int64,
         basename: String,
         sourceDir: String,
         captureDate: Int64?,
         now: Int64,
         in db: Database
     ) throws -> Photo {
-        if var existing = try findPhoto(basename: basename, sourceDir: sourceDir, in: db) {
+        if var existing = try findPhoto(libraryId: libraryId, basename: basename, sourceDir: sourceDir, in: db) {
             if existing.captureDate == nil, let captureDate {
                 existing.captureDate = captureDate
                 existing.updatedAt = now
@@ -136,6 +166,7 @@ public enum PhotoRepository {
             return existing
         }
         var photo = Photo(
+            libraryId: libraryId,
             basename: basename,
             sourceDir: sourceDir,
             captureDate: captureDate,
@@ -271,14 +302,14 @@ public enum PhotoRepository {
     }
 
     /// First-run baseline (spec §6): every photo discovered by the initial index
-    /// becomes `reviewed`, not `new`. Idempotent — only touches rows still at `.new`.
+    /// becomes `accepted`, not `new`. Idempotent — only touches rows still at `.new`.
     @discardableResult
-    public static func markAllAsReviewedBaseline(now: Int64, in db: Database) throws -> Int {
+    public static func markAllAsAcceptedBaseline(now: Int64, in db: Database) throws -> Int {
         try Photo
             .filter(Photo.Columns.lifecycleState == LifecycleState.new.rawValue)
             .updateAll(
                 db,
-                Photo.Columns.lifecycleState.set(to: LifecycleState.reviewed.rawValue),
+                Photo.Columns.lifecycleState.set(to: LifecycleState.accepted.rawValue),
                 Photo.Columns.updatedAt.set(to: now)
             )
     }

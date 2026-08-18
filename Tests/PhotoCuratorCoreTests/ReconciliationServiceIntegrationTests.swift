@@ -10,6 +10,15 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         return try AppDatabase(path: dbURL)
     }
 
+    /// Registers a `photo_libraries` row for `url` and returns the matching
+    /// `LibrarySource` to pass to `reconcile(photoLibraries:...)`.
+    private func registerLibrary(at url: URL, database: AppDatabase, name: String = "Test Library") async throws -> LibrarySource {
+        let library = try await database.write { db in
+            try PhotoLibraryRepository.create(name: name, bookmarkData: Data(), now: 0, in: db)
+        }
+        return LibrarySource(id: library.id!, url: url)
+    }
+
     func testFirstRunIndexesFilesGroupsSiblingsAndEstablishesBaseline() async throws {
         let photoRoot = try makeTempDirectory()
         let exportRoot = try makeTempDirectory()
@@ -25,8 +34,9 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         try Data("fake jpg bytes 2".utf8).write(to: cameraDir.appendingPathComponent("IMG_0002.jpg"))
 
         let database = try makeDatabase()
+        let library = try await registerLibrary(at: photoRoot, database: database)
         let service = ReconciliationService(database: database)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
         XCTAssertEqual(photos.count, 2)
@@ -41,7 +51,7 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
 
         // First-run baseline (spec §6): everything from the initial index is
         // `reviewed`, not `new`.
-        XCTAssertTrue(photos.allSatisfy { $0.photo.lifecycleState == .reviewed })
+        XCTAssertTrue(photos.allSatisfy { $0.photo.lifecycleState == .accepted })
         let baselineFlag = try await database.read { db in
             try AppStateRepository.getBool(AppStateKey.baselineEstablished, in: db)
         }
@@ -60,14 +70,15 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         try Data("first".utf8).write(to: cameraDir.appendingPathComponent("IMG_0001.jpg"))
 
         let database = try makeDatabase()
+        let library = try await registerLibrary(at: photoRoot, database: database)
         let service = ReconciliationService(database: database)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         try Data("second".utf8).write(to: cameraDir.appendingPathComponent("IMG_0002.jpg"))
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
-        XCTAssertEqual(photos.first { $0.photo.basename == "IMG_0001" }?.photo.lifecycleState, .reviewed)
+        XCTAssertEqual(photos.first { $0.photo.basename == "IMG_0001" }?.photo.lifecycleState, .accepted)
         XCTAssertEqual(photos.first { $0.photo.basename == "IMG_0002" }?.photo.lifecycleState, .new)
     }
 
@@ -84,11 +95,12 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         try Data("first".utf8).write(to: fileURL)
 
         let database = try makeDatabase()
+        let library = try await registerLibrary(at: photoRoot, database: database)
         let service = ReconciliationService(database: database)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         try FileManager.default.removeItem(at: fileURL)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
         XCTAssertTrue(photos.isEmpty, "a photo whose only file disappeared should be removed, not left dangling")
@@ -109,8 +121,9 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         try Data("first".utf8).write(to: originalURL)
 
         let database = try makeDatabase()
+        let library = try await registerLibrary(at: photoRoot, database: database)
         let service = ReconciliationService(database: database)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         // Preserve mtime so the provisional key (filename+size+mtime) still matches
         // after the move, exactly like a Finder move would.
@@ -119,7 +132,7 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         try FileManager.default.moveItem(at: originalURL, to: movedURL)
         try FileManager.default.setAttributes(attributes, ofItemAtPath: movedURL.path)
 
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
         XCTAssertEqual(photos.count, 1, "a move must reconcile the existing row, not create a duplicate")
@@ -139,12 +152,45 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         try Data("first".utf8).write(to: cameraDir.appendingPathComponent("IMG_0001.jpg"))
 
         let database = try makeDatabase()
+        let library = try await registerLibrary(at: photoRoot, database: database)
         let service = ReconciliationService(database: database)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
-        try await service.reconcile(photoFolder: photoRoot, exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
         let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
         XCTAssertEqual(photos.count, 1)
         XCTAssertEqual(photos.first?.representations.count, 1)
+    }
+
+    func testTwoLibrariesWithIdenticalRelativePathsDoNotCrossMatch() async throws {
+        let libraryARoot = try makeTempDirectory()
+        let libraryBRoot = try makeTempDirectory()
+        let exportRoot = try makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: libraryARoot)
+            try? FileManager.default.removeItem(at: libraryBRoot)
+            try? FileManager.default.removeItem(at: exportRoot)
+        }
+        let cameraDirA = libraryARoot.appendingPathComponent("CameraA", isDirectory: true)
+        let cameraDirB = libraryBRoot.appendingPathComponent("CameraA", isDirectory: true)
+        try FileManager.default.createDirectory(at: cameraDirA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cameraDirB, withIntermediateDirectories: true)
+        // Same relative path ("CameraA/IMG_0001.jpg") and same basename in both
+        // libraries — only `library_id` scoping keeps these from colliding or being
+        // mistaken for a move of one another.
+        try Data("library A bytes".utf8).write(to: cameraDirA.appendingPathComponent("IMG_0001.jpg"))
+        try Data("library B bytes, different content".utf8).write(to: cameraDirB.appendingPathComponent("IMG_0001.jpg"))
+
+        let database = try makeDatabase()
+        let libraryA = try await registerLibrary(at: libraryARoot, database: database, name: "Library A")
+        let libraryB = try await registerLibrary(at: libraryBRoot, database: database, name: "Library B")
+        let service = ReconciliationService(database: database)
+        try await service.reconcile(photoLibraries: [libraryA, libraryB], exportFolder: exportRoot)
+
+        let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
+        XCTAssertEqual(photos.count, 2, "identical relative paths under two different libraries must not collide into one Photo")
+
+        let libraryIds = Set(photos.map(\.photo.libraryId))
+        XCTAssertEqual(libraryIds, [libraryA.id, libraryB.id], "each photo must be tagged with its own library, not the other's")
     }
 }

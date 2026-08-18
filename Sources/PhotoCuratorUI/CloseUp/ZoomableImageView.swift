@@ -20,11 +20,18 @@ private final class ZoomableScrollView: NSScrollView {
             super.scrollWheel(with: event)
             return
         }
-        let pointInView = convert(event.locationInWindow, from: nil)
+        // `setMagnification(_:centeredAt:)` wants its point in *content view*
+        // space (the NSClipView's coordinate system, which reflects the current
+        // scroll/pan offset) — not the scroll view's own fixed viewport bounds,
+        // which is what `self.convert` gives you. Using the wrong space here
+        // means the anchor point is only correct while unscrolled; the moment
+        // you've panned (e.g. by zooming in and moving the pointer), zooming
+        // out anchors on the wrong spot in the image and visibly jumps.
+        let pointInContent = contentView.convert(event.locationInWindow, from: nil)
         let clampedDelta = event.deltaY.clamped(to: -10...10)
         let zoomFactor = 1 + (clampedDelta * 0.03)
         let newMagnification = (magnification * zoomFactor).clamped(to: minMagnification...maxMagnification)
-        setMagnification(newMagnification, centeredAt: pointInView)
+        setMagnification(newMagnification, centeredAt: pointInContent)
     }
 
     override func mouseDown(with event: NSEvent) {

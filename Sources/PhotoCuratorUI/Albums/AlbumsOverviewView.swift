@@ -68,7 +68,7 @@ private struct AlbumRow: View {
     let summary: AlbumSummary
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 20) {
             ZStack {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(.quaternary)
@@ -84,7 +84,7 @@ private struct AlbumRow: View {
             }
             .frame(width: 56, height: 56)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(summary.album.name)
                     .font(.headline)
                 Text("^[\(summary.photoCount) photo](inflect: true)")

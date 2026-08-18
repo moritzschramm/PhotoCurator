@@ -8,8 +8,10 @@ struct PhotoGridRepresentable: NSViewControllerRepresentable {
     let entries: [PhotoGridEntry]
     let itemSize: CGFloat
     @Binding var selection: Set<Int64>
+    var isReorderingEnabled: Bool = false
     var onOpen: (Int64) -> Void
     var onZoomDelta: (CGFloat) -> Void
+    var onReorder: (([Int64]) -> Void)? = nil
 
     func makeNSViewController(context: Context) -> PhotoGridViewController {
         let controller = PhotoGridViewController()
@@ -24,6 +26,8 @@ struct PhotoGridRepresentable: NSViewControllerRepresentable {
         }
         controller.onOpen = onOpen
         controller.onZoomDelta = onZoomDelta
+        controller.onReorder = onReorder
+        controller.isReorderingEnabled = isReorderingEnabled
         controller.update(entries: entries, itemSize: itemSize, selection: selection)
         return controller
     }
@@ -31,6 +35,8 @@ struct PhotoGridRepresentable: NSViewControllerRepresentable {
     func updateNSViewController(_ controller: PhotoGridViewController, context: Context) {
         controller.onOpen = onOpen
         controller.onZoomDelta = onZoomDelta
+        controller.onReorder = onReorder
+        controller.isReorderingEnabled = isReorderingEnabled
         controller.onSelectionChange = { newSelection in
             if selection != newSelection {
                 selection = newSelection

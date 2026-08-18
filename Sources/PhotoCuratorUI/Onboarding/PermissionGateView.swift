@@ -3,22 +3,11 @@ import UniformTypeIdentifiers
 import PhotoCuratorCore
 
 /// First-run (and any-run, if a grant needs renewing) folder access gate (spec §9):
-/// the app does not operate until both the photo library and export target folders
-/// are granted.
+/// the app does not operate until at least one photo library and the export target
+/// are both granted.
 struct PermissionGateView: View {
     @Environment(AppEnvironment.self) private var environment
-    // A single `.fileImporter`, not one per button: attaching two of them to the same
-    // view is a known SwiftUI/macOS quirk where only the outermost one reliably
-    // presents — the other's `isPresented` flips true but no panel appears.
-    //
-    // `pickerRole` and `isPickerPresented` are deliberately two independent state
-    // vars, not one Optional driving both via a computed Binding: if `set` on that
-    // Binding clears the role as soon as the panel dismisses, it can race with (or
-    // run before) `onCompletion` reading it, so the completion handler silently
-    // never fires. `pickerRole` here is only ever written by the buttons and only
-    // ever read by `onCompletion` — nothing else clears it.
-    @State private var pickerRole: FolderRole = .photoLibrary
-    @State private var isPickerPresented = false
+    @State private var isExportPickerPresented = false
     @State private var pickError: String?
 
     var body: some View {
@@ -27,24 +16,29 @@ struct PermissionGateView: View {
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
 
-            Text("PhotoCurator needs two folders")
+            Text("PhotoCurator needs at least one photo library and an export folder")
                 .font(.title2.bold())
+                .multilineTextAlignment(.center)
 
             Text("Both are required before the app can run. Access is remembered after this.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            VStack(spacing: 12) {
-                grantRow(
-                    title: "Photo library (Proton Drive folder)",
-                    granted: environment.folderAccess.photoLibrary != nil,
-                    action: { pickerRole = .photoLibrary; isPickerPresented = true }
-                )
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Photo libraries")
+                    .font(.headline)
+                PhotoLibraryListView()
+
+                Divider()
+                    .padding(.vertical, 4)
+
+                Text("Export / gallery target")
+                    .font(.headline)
                 grantRow(
                     title: "Export / gallery target folder",
                     granted: environment.folderAccess.exportTarget != nil,
-                    action: { pickerRole = .exportTarget; isPickerPresented = true }
+                    action: { isExportPickerPresented = true }
                 )
             }
             .frame(maxWidth: 440)
@@ -64,9 +58,9 @@ struct PermissionGateView: View {
             }
         }
         .padding(40)
-        .frame(minWidth: 480, minHeight: 420)
-        .fileImporter(isPresented: $isPickerPresented, allowedContentTypes: [.folder]) { result in
-            handlePick(result, role: pickerRole)
+        .frame(minWidth: 520, minHeight: 520)
+        .fileImporter(isPresented: $isExportPickerPresented, allowedContentTypes: [.folder]) { result in
+            handleExportPick(result)
         }
     }
 
@@ -82,7 +76,7 @@ struct PermissionGateView: View {
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func handlePick(_ result: Result<URL, Error>, role: FolderRole) {
+    private func handleExportPick(_ result: Result<URL, Error>) {
         guard case .success(let url) = result else { return }
         // The picker hands back a URL with only a transient sandbox grant — it must
         // be activated with startAccessingSecurityScopedResource() before the app
@@ -97,7 +91,7 @@ struct PermissionGateView: View {
             // security-scope timing constraint) is deferred to a Task.
             let bookmarkData = try BookmarkStore.makeBookmarkData(for: url)
             pickError = nil
-            Task { await environment.grantAccess(bookmarkData: bookmarkData, role: role) }
+            Task { await environment.grantExportAccess(bookmarkData: bookmarkData) }
         } catch {
             pickError = "Could not access \"\(url.lastPathComponent)\": \(error.localizedDescription)"
         }

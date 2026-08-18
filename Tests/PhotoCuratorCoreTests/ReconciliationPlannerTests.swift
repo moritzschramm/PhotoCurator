@@ -29,7 +29,7 @@ final class ReconciliationPlannerTests: XCTestCase {
         isLocal: Bool = true
     ) -> Representation {
         Representation(
-            id: id, photoId: id, kind: .jpg, relativePath: relativePath, filename: filename,
+            id: id, libraryId: 1, photoId: id, kind: .jpg, relativePath: relativePath, filename: filename,
             fileSize: size, fileMtime: mtime, isLocal: isLocal, indexedAt: 1
         )
     }

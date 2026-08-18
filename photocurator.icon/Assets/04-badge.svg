@@ -1,0 +1,12 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-label="Selection badge layer">
+  <defs>
+    <linearGradient id="badge" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#5BD97C"/>
+      <stop offset="1" stop-color="#20A046"/>
+    </linearGradient>
+  </defs>
+  <!-- Gloss/specular and shadow are added by Icon Composer; keep the mark flat and dominant. -->
+  <circle cx="700" cy="712" r="156" fill="url(#badge)"/>
+  <path d="M628 716 L682 772 L778 648" fill="none" stroke="#FFFFFF"
+        stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

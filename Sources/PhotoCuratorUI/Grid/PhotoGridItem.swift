@@ -107,15 +107,15 @@ final class PhotoGridItem: NSCollectionViewItem {
             stateBadge.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Candidate")
             stateBadge.contentTintColor = .systemYellow
             stateBadge.isHidden = false
-        case .published:
-            stateBadge.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Published")
+        case .accepted:
+            stateBadge.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Accepted")
             stateBadge.contentTintColor = .systemGreen
             stateBadge.isHidden = false
         case .rejected:
             stateBadge.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Rejected")
             stateBadge.contentTintColor = .systemRed
             stateBadge.isHidden = false
-        case .new, .reviewed:
+        case .new:
             stateBadge.isHidden = true
         }
 
@@ -125,9 +125,15 @@ final class PhotoGridItem: NSCollectionViewItem {
 
     override var isSelected: Bool {
         didSet {
+            // `borderWidth`/`borderColor` are implicitly-animatable CALayer
+            // properties — without disabling actions, the selection box fades in
+            // over ~0.25s instead of appearing the instant you click.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             view.layer?.borderWidth = isSelected ? 3 : 0
             view.layer?.borderColor = NSColor.controlAccentColor.cgColor
             view.layer?.cornerRadius = 6
+            CATransaction.commit()
         }
     }
 }

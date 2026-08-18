@@ -25,31 +25,39 @@ public struct SecurityScopedFolder: Sendable {
     }
 }
 
-/// Which of the two first-run folder grants a bookmark belongs to (spec §9).
-public enum FolderRole: String, Sendable, CaseIterable {
-    case photoLibrary
-    case exportTarget
+/// A resolved, registered photo-library directory (spec: multiple photo libraries) —
+/// pairs a `PhotoLibrary` row's id/name with its resolved, security-scoped folder.
+public struct PhotoLibraryFolder: Sendable, Identifiable, Equatable {
+    public let id: Int64
+    public let name: String
+    public let folder: SecurityScopedFolder
 
-    var appStateKey: String {
-        switch self {
-        case .photoLibrary: return AppStateKey.photoFolderBookmark
-        case .exportTarget: return AppStateKey.exportFolderBookmark
-        }
+    public init(id: Int64, name: String, folder: SecurityScopedFolder) {
+        self.id = id
+        self.name = name
+        self.folder = folder
+    }
+
+    public var url: URL { folder.url }
+
+    public static func == (lhs: PhotoLibraryFolder, rhs: PhotoLibraryFolder) -> Bool {
+        lhs.id == rhs.id && lhs.name == rhs.name && lhs.folder.url == rhs.folder.url
     }
 }
 
-/// Current grant state of both persisted folders. The app hard-gates on
-/// `isFullyGranted` at launch (spec §9).
+/// Current grant state of every registered photo library plus the single export
+/// target. The app hard-gates on `isFullyGranted` at launch (spec §9): at least one
+/// photo library and the export target.
 public struct FolderAccessStatus: Sendable {
-    public var photoLibrary: SecurityScopedFolder?
+    public var photoLibraries: [PhotoLibraryFolder]
     public var exportTarget: SecurityScopedFolder?
 
-    public init(photoLibrary: SecurityScopedFolder?, exportTarget: SecurityScopedFolder?) {
-        self.photoLibrary = photoLibrary
+    public init(photoLibraries: [PhotoLibraryFolder], exportTarget: SecurityScopedFolder?) {
+        self.photoLibraries = photoLibraries
         self.exportTarget = exportTarget
     }
 
     public var isFullyGranted: Bool {
-        photoLibrary != nil && exportTarget != nil
+        !photoLibraries.isEmpty && exportTarget != nil
     }
 }

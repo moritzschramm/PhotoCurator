@@ -17,14 +17,5 @@
 	     resolving across app launches. -->
 	<key>com.apple.security.files.bookmarks.app-scope</key>
 	<true/>
-
-	<!-- SD card / camera card reader access, resolved at first read rather than a
-	     first-run folder grant (spec §9). NOTE: verify this exact key against
-	     current Apple documentation before shipping — Apple's entitlement key
-	     reference for less-common keys like this one changes over time and this
-	     could not be independently re-verified against a live docs page while
-	     generating this file (see accompanying README caveat). -->
-	<key>com.apple.security.files.removable-media.read-only</key>
-	<true/>
 </dict>
 </plist>

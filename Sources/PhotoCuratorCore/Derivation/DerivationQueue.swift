@@ -20,8 +20,10 @@ public actor DerivationQueue {
 
     /// Derives every local-but-underived representation, several at a time. Meant to
     /// run right after reconciliation/import — local files derive immediately rather
-    /// than waiting for the user to open them.
-    public func processLocalBacklog(photoRoot: URL, maxConcurrent: Int = 4) async {
+    /// than waiting for the user to open them. `photoRoots` maps each library's id to
+    /// its resolved root URL; a representation whose library isn't present (e.g.
+    /// removed mid-backlog) is skipped rather than failing the whole batch.
+    public func processLocalBacklog(photoRoots: [Int64: URL], maxConcurrent: Int = 4) async {
         guard !isProcessingBacklog else { return }
         isProcessingBacklog = true
         defer { isProcessingBacklog = false }
@@ -39,10 +41,13 @@ public actor DerivationQueue {
             var iterator = pending.makeIterator()
 
             func startNext() {
-                guard let rep = iterator.next(), let repId = rep.id else { return }
-                group.addTask {
-                    let url = rep.fileURL(photoRoot: photoRoot)
-                    _ = try? await derivationService.derive(representationId: repId, fileURL: url, kind: rep.kind)
+                while let rep = iterator.next() {
+                    guard let repId = rep.id, let photoRoot = photoRoots[rep.libraryId] else { continue }
+                    group.addTask {
+                        let url = rep.fileURL(photoRoot: photoRoot)
+                        _ = try? await derivationService.derive(representationId: repId, fileURL: url, kind: rep.kind)
+                    }
+                    return
                 }
             }
 

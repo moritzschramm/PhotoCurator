@@ -16,6 +16,7 @@ public enum DerivationState: String, Codable, Sendable, CaseIterable, DatabaseVa
 /// materialization, per spec §5.
 public struct Representation: Codable, Equatable, Identifiable, Sendable {
     public var id: Int64?
+    public var libraryId: Int64
     public var photoId: Int64
     public var kind: RepresentationKind
     public var relativePath: String
@@ -29,6 +30,7 @@ public struct Representation: Codable, Equatable, Identifiable, Sendable {
 
     public init(
         id: Int64? = nil,
+        libraryId: Int64,
         photoId: Int64,
         kind: RepresentationKind,
         relativePath: String,
@@ -41,6 +43,7 @@ public struct Representation: Codable, Equatable, Identifiable, Sendable {
         indexedAt: Int64
     ) {
         self.id = id
+        self.libraryId = libraryId
         self.photoId = photoId
         self.kind = kind
         self.relativePath = relativePath
@@ -59,6 +62,7 @@ extension Representation: FetchableRecord, MutablePersistableRecord {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case libraryId = "library_id"
         case photoId = "photo_id"
         case kind
         case relativePath = "relative_path"
@@ -79,6 +83,7 @@ extension Representation: FetchableRecord, MutablePersistableRecord {
 extension Representation {
     public enum Columns {
         public static let id = Column(CodingKeys.id)
+        public static let libraryId = Column(CodingKeys.libraryId)
         public static let photoId = Column(CodingKeys.photoId)
         public static let kind = Column(CodingKeys.kind)
         public static let relativePath = Column(CodingKeys.relativePath)

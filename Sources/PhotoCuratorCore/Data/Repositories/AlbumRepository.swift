@@ -59,34 +59,62 @@ public enum AlbumRepository {
             .fetchOne(db)?.cachePath
     }
 
-    /// All photos in an album, joined with their representations, ordered by when
-    /// they were added (most recent addition first).
+    /// All photos in an album, joined with their representations, in the album's
+    /// manual drag-and-drop order (`PhotoAlbum.position`) — not capture date or
+    /// add time. `Photo.filter(ids.contains(...))` doesn't preserve the order of
+    /// `ids`, so the final array is rebuilt by walking `orderedPhotoIds` rather
+    /// than mapping the fetched `photos` directly.
     public static func photos(albumId: Int64, in db: Database) throws -> [PhotoWithRepresentations] {
-        let photoIds = try PhotoAlbum
-            .filter(Column("album_id") == albumId)
+        let orderedPhotoIds = try PhotoAlbum
+            .filter(PhotoAlbum.Columns.albumId == albumId)
+            .order(PhotoAlbum.Columns.position.asc)
             .fetchAll(db)
             .map(\.photoId)
+        guard !orderedPhotoIds.isEmpty else { return [] }
 
-        // Newest capture date first, matching the main library grid — sorting by
-        // when each photo was *added to the album* instead (the previous
-        // behavior) tracks UI click order during multi-select, not anything about
-        // the photos themselves, and looks arbitrary when browsing.
-        let photos = try Photo
-            .filter(photoIds.contains(Photo.Columns.id))
-            .order(Photo.Columns.captureDate.desc, Photo.Columns.basename.asc, Photo.Columns.id.asc)
-            .fetchAll(db)
-        let allReps = try Representation.filter(photoIds.contains(Representation.Columns.photoId)).fetchAll(db)
+        let photos = try Photo.filter(orderedPhotoIds.contains(Photo.Columns.id)).fetchAll(db)
+        let photosById = Dictionary(uniqueKeysWithValues: photos.compactMap { photo in photo.id.map { ($0, photo) } })
+        let allReps = try Representation.filter(orderedPhotoIds.contains(Representation.Columns.photoId)).fetchAll(db)
         let repsByPhoto = Dictionary(grouping: allReps, by: { $0.photoId })
 
-        return photos.map { photo in
-            PhotoWithRepresentations(photo: photo, representations: repsByPhoto[photo.id ?? -1] ?? [])
+        return orderedPhotoIds.compactMap { photoId in
+            guard let photo = photosById[photoId] else { return nil }
+            return PhotoWithRepresentations(photo: photo, representations: repsByPhoto[photoId] ?? [])
         }
+    }
+
+    /// Persists a manual drag-and-drop reorder: `orderedPhotoIds` is the
+    /// complete, already-final desired order (not a delta), so this just
+    /// re-numbers every membership row to match its index in it.
+    public static func reorderPhotos(albumId: Int64, orderedPhotoIds: [Int64], in db: Database) throws {
+        for (index, photoId) in orderedPhotoIds.enumerated() {
+            try db.execute(
+                sql: "UPDATE photo_albums SET position = ? WHERE album_id = ? AND photo_id = ?",
+                arguments: [Int64(index), albumId, photoId]
+            )
+        }
+    }
+
+    private static func nextPosition(albumId: Int64, in db: Database) throws -> Int64 {
+        let maxPosition = try Int64.fetchOne(
+            db,
+            sql: "SELECT COALESCE(MAX(position), -1) FROM photo_albums WHERE album_id = ?",
+            arguments: [albumId]
+        ) ?? -1
+        return maxPosition + 1
     }
 
     /// Every album a given photo currently belongs to.
     public static func albumIds(photoId: Int64, in db: Database) throws -> Set<Int64> {
         let rows = try PhotoAlbum.filter(Column("photo_id") == photoId).fetchAll(db)
         return Set(rows.map(\.albumId))
+    }
+
+    /// Batch variant for a multi-select "Add to Album" menu, so it can show a
+    /// checkmark per album without one query per selected photo.
+    public static func albumIds(photoIds: [Int64], in db: Database) throws -> [Int64: Set<Int64>] {
+        let rows = try PhotoAlbum.filter(photoIds.contains(Column("photo_id"))).fetchAll(db)
+        return Dictionary(grouping: rows, by: \.photoId).mapValues { Set($0.map(\.albumId)) }
     }
 
     @discardableResult
@@ -110,19 +138,59 @@ public enum AlbumRepository {
     }
 
     /// Adding a photo to an album creates one `photo_albums` row — no file copy, no
-    /// directory (spec §7.5). Idempotent: re-adding an already-member photo is a no-op.
+    /// directory (spec §7.5). Idempotent: re-adding an already-member photo is a
+    /// no-op (position included — it doesn't get bumped to the end again).
+    /// Appended after everything already in the album.
     public static func addPhoto(photoId: Int64, albumId: Int64, now: Int64, in db: Database) throws {
         let exists = try PhotoAlbum
             .filter(Column("photo_id") == photoId && Column("album_id") == albumId)
             .fetchCount(db) > 0
         guard !exists else { return }
-        let membership = PhotoAlbum(photoId: photoId, albumId: albumId, addedAt: now)
+        let position = try nextPosition(albumId: albumId, in: db)
+        let membership = PhotoAlbum(photoId: photoId, albumId: albumId, addedAt: now, position: position)
         try membership.insert(db)
+    }
+
+    /// Adds several photos to an album in one batch, appended after everything
+    /// already in the album. The batch's own initial relative order is
+    /// alphabetical by filename (not selection/click order, which would
+    /// otherwise look arbitrary) — photos already in the album are left
+    /// untouched, both in membership and position.
+    public static func addPhotos(photoIds: [Int64], albumId: Int64, now: Int64, in db: Database) throws {
+        guard !photoIds.isEmpty else { return }
+        let existingMemberIds = Set(
+            try PhotoAlbum
+                .filter(PhotoAlbum.Columns.albumId == albumId && photoIds.contains(PhotoAlbum.Columns.photoId))
+                .fetchAll(db)
+                .map(\.photoId)
+        )
+        let newIds = photoIds.filter { !existingMemberIds.contains($0) }
+        guard !newIds.isEmpty else { return }
+
+        let photos = try Photo.filter(newIds.contains(Photo.Columns.id)).fetchAll(db)
+        let basenameById = Dictionary(uniqueKeysWithValues: photos.compactMap { photo in photo.id.map { ($0, photo.basename) } })
+        let sortedIds = newIds.sorted { a, b in
+            (basenameById[a] ?? "").localizedStandardCompare(basenameById[b] ?? "") == .orderedAscending
+        }
+
+        var position = try nextPosition(albumId: albumId, in: db)
+        for photoId in sortedIds {
+            try PhotoAlbum(photoId: photoId, albumId: albumId, addedAt: now, position: position).insert(db)
+            position += 1
+        }
     }
 
     public static func removePhoto(photoId: Int64, albumId: Int64, in db: Database) throws {
         _ = try PhotoAlbum
             .filter(Column("photo_id") == photoId && Column("album_id") == albumId)
+            .deleteAll(db)
+    }
+
+    /// Batch counterpart to `addPhotos`, for the multi-select "Add to Album" menu's
+    /// toggle-off case.
+    public static func removePhotos(photoIds: [Int64], albumId: Int64, in db: Database) throws {
+        _ = try PhotoAlbum
+            .filter(Column("album_id") == albumId && photoIds.contains(Column("photo_id")))
             .deleteAll(db)
     }
 

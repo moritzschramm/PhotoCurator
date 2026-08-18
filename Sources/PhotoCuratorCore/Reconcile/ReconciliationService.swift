@@ -5,10 +5,22 @@ public enum ReconciliationError: Error {
     case alreadyRunning
 }
 
-/// Startup reconciliation (spec §7.1): enumerates the photo folder and the export
-/// target, diffs against the database, and reconciles rather than duplicates. Runs
-/// off the main thread by construction — every step here is `async` and does its own
-/// batched, transactional writes, so it is safe to call from a background `Task`.
+/// One registered photo-library root to reconcile against.
+public struct LibrarySource: Sendable {
+    public var id: Int64
+    public var url: URL
+
+    public init(id: Int64, url: URL) {
+        self.id = id
+        self.url = url
+    }
+}
+
+/// Startup reconciliation (spec §7.1): enumerates every registered photo library and
+/// the export target, diffs each against the database, and reconciles rather than
+/// duplicates. Runs off the main thread by construction — every step here is `async`
+/// and does its own batched, transactional writes, so it is safe to call from a
+/// background `Task`.
 public actor ReconciliationService {
     public struct Progress: Sendable, Equatable {
         public enum Phase: Sendable, Equatable {
@@ -37,8 +49,12 @@ public actor ReconciliationService {
         self.database = database
     }
 
+    /// Reconciles every entry in `photoLibraries` in turn (each fully isolated by its
+    /// own `libraryId`, so two libraries never cross-match each other's files as
+    /// "moved"), then the single export target once, then establishes the baseline
+    /// once total — not once per library.
     public func reconcile(
-        photoFolder: URL,
+        photoLibraries: [LibrarySource],
         exportFolder: URL,
         onProgress: (@Sendable (Progress) -> Void)? = nil
     ) async throws {
@@ -46,12 +62,14 @@ public actor ReconciliationService {
         isRunning = true
         defer { isRunning = false }
 
-        onProgress?(Progress(phase: .enumeratingPhotoLibrary))
-        let photoFiles = try DirectoryEnumerator.enumerateFiles(under: photoFolder)
+        for library in photoLibraries {
+            onProgress?(Progress(phase: .enumeratingPhotoLibrary))
+            let photoFiles = try DirectoryEnumerator.enumerateFiles(under: library.url)
 
-        onProgress?(Progress(phase: .reconcilingPhotoLibrary, total: photoFiles.count))
-        try await reconcilePhotoLibrary(photoFiles) { processed in
-            onProgress?(Progress(phase: .reconcilingPhotoLibrary, processed: processed, total: photoFiles.count))
+            onProgress?(Progress(phase: .reconcilingPhotoLibrary, total: photoFiles.count))
+            try await reconcilePhotoLibrary(photoFiles, libraryId: library.id) { processed in
+                onProgress?(Progress(phase: .reconcilingPhotoLibrary, processed: processed, total: photoFiles.count))
+            }
         }
 
         // Retroactively fixes sort order for photos indexed before capture-date
@@ -76,8 +94,10 @@ public actor ReconciliationService {
 
     // MARK: Photo library
 
-    private func reconcilePhotoLibrary(_ files: [EnumeratedFile], onBatch: @Sendable (Int) -> Void) async throws {
-        let existing = try await database.read { db in try Representation.fetchAll(db) }
+    private func reconcilePhotoLibrary(_ files: [EnumeratedFile], libraryId: Int64, onBatch: @Sendable (Int) -> Void) async throws {
+        let existing = try await database.read { db in
+            try Representation.filter(Representation.Columns.libraryId == libraryId).fetchAll(db)
+        }
         let plan = ReconciliationPlanner.diff(files: files, existing: existing)
 
         var processed = 0
@@ -103,7 +123,7 @@ public actor ReconciliationService {
                     guard let existingRep = try PhotoRepository.fetchRepresentation(id: move.representationId, in: db) else {
                         continue
                     }
-                    try Self.reassignRepresentation(existingRep, to: move.file, now: now, in: db)
+                    try Self.reassignRepresentation(existingRep, libraryId: libraryId, to: move.file, now: now, in: db)
                 }
             }
             processed += batch.count
@@ -120,7 +140,7 @@ public actor ReconciliationService {
                 let now = Int64(Date().timeIntervalSince1970)
                 var rescued: [Int64] = []
                 for newFile in batch {
-                    if let rescuedId = try Self.applyNewFile(newFile, now: now, in: db) {
+                    if let rescuedId = try Self.applyNewFile(newFile, libraryId: libraryId, now: now, in: db) {
                         rescued.append(rescuedId)
                     }
                 }
@@ -155,6 +175,7 @@ public actor ReconciliationService {
     @discardableResult
     private static func applyNewFile(
         _ newFile: ReconciliationPlanner.Plan.NewFile,
+        libraryId: Int64,
         now: Int64,
         in db: Database
     ) throws -> Int64? {
@@ -163,12 +184,17 @@ public actor ReconciliationService {
             computedHash = try? ContentHasher.sha256(ofFileAt: newFile.file.url)
         }
 
+        // Deliberately unscoped by libraryId: a byte-identical file already indexed
+        // under a *different* library is still the same real-world photo, and
+        // shouldn't be re-stored as a second copy just because it's being
+        // encountered again via a different registered root.
         if let hash = computedHash, let match = try PhotoRepository.findRepresentation(contentHash: hash, in: db) {
-            try reassignRepresentation(match, to: newFile.file, now: now, in: db)
+            try reassignRepresentation(match, libraryId: libraryId, to: newFile.file, now: now, in: db)
             return match.id
         }
 
         let photo = try PhotoRepository.upsertPhoto(
+            libraryId: libraryId,
             basename: newFile.basename,
             sourceDir: newFile.file.sourceDir,
             // Provisional sort key until EXIF derivation backfills the real
@@ -181,6 +207,7 @@ public actor ReconciliationService {
         )
         guard let photoId = photo.id else { return nil }
         let rep = Representation(
+            libraryId: libraryId,
             photoId: photoId,
             kind: newFile.kind,
             relativePath: newFile.file.relativePath,
@@ -198,9 +225,14 @@ public actor ReconciliationService {
 
     /// Repoints an existing representation row at its new location, re-deriving which
     /// Photo it groups under (source dir / basename may have changed), and cleans up
-    /// the old Photo if this was its last remaining representation.
+    /// the old Photo if this was its last remaining representation. `libraryId` is the
+    /// library currently being reconciled — a representation being "moved" always
+    /// stays within the same library being scanned; a hash-rescue match found under a
+    /// different library (see `applyNewFile`) is re-pointed to this one instead, which
+    /// is the correct behavior since the file is now physically located here.
     private static func reassignRepresentation(
         _ existing: Representation,
+        libraryId: Int64,
         to file: EnumeratedFile,
         now: Int64,
         in db: Database
@@ -208,6 +240,7 @@ public actor ReconciliationService {
         guard let kind = RepresentationFileType.kind(forExtension: file.fileExtension) else { return }
         let oldPhotoId = existing.photoId
         let photo = try PhotoRepository.upsertPhoto(
+            libraryId: libraryId,
             basename: ReconciliationPlanner.basename(for: file.filename),
             sourceDir: file.sourceDir,
             captureDate: file.fileMtimeEpoch,
@@ -217,6 +250,7 @@ public actor ReconciliationService {
         guard let photoId = photo.id else { return }
 
         var rep = existing
+        rep.libraryId = libraryId
         rep.photoId = photoId
         rep.kind = kind
         rep.relativePath = file.relativePath
@@ -263,7 +297,7 @@ public actor ReconciliationService {
         guard !alreadyEstablished else { return }
         try await database.write { db in
             let now = Int64(Date().timeIntervalSince1970)
-            try PhotoRepository.markAllAsReviewedBaseline(now: now, in: db)
+            try PhotoRepository.markAllAsAcceptedBaseline(now: now, in: db)
             try AppStateRepository.setBool(true, forKey: AppStateKey.baselineEstablished, in: db)
         }
     }

@@ -10,6 +10,7 @@ struct CloseUpView: View {
     @State private var loader = CloseUpImageLoader()
     @State private var albumStore = AlbumScopeStore()
     @State private var exif: ExifRecord?
+    @State private var currentPhotoAlbumIds: Set<Int64> = []
 
     @Environment(AppEnvironment.self) private var environment
     @Environment(\.dismiss) private var dismiss
@@ -21,7 +22,8 @@ struct CloseUpView: View {
 
     private var orderedIds: [Int64] {
         switch scope {
-        case .library: return environment.gridEntries.map(\.id)
+        case .library(let id): return environment.gridEntries(libraryId: id).map(\.id)
+        case .unassigned: return environment.unassignedGridEntries.map(\.id)
         case .album: return albumStore.entries.map(\.id)
         }
     }
@@ -46,7 +48,8 @@ struct CloseUpView: View {
         }
         .task(id: currentPhotoId) {
             exif = nil
-            guard let pwr, let photoRoot = environment.photoLibraryRootURL else { return }
+            currentPhotoAlbumIds = await environment.albumIds(forPhotoIds: [currentPhotoId])[currentPhotoId] ?? []
+            guard let pwr, let photoRoot = environment.libraryRootURL(for: pwr.photo.libraryId) else { return }
             loader.load(pwr: pwr, photoRoot: photoRoot, database: environment.database, derivationQueue: environment.derivationQueue)
             if let repId = (pwr.jpg ?? pwr.raw)?.id {
                 exif = try? await environment.database.read { db in try PhotoRepository.fetchExif(representationId: repId, in: db) }
@@ -206,18 +209,24 @@ struct CloseUpView: View {
             .keyboardShortcut("x", modifiers: [])
 
             Button {
-                Task { await environment.setLifecycle(photoIds: [currentPhotoId], state: .reviewed) }
+                Task { await environment.setLifecycle(photoIds: [currentPhotoId], state: .accepted) }
             } label: {
-                Label("Reviewed", systemImage: "checkmark")
+                Label("Accept", systemImage: "checkmark")
             }
             .keyboardShortcut("u", modifiers: [])
 
             Menu {
                 ForEach(environment.albums) { album in
                     let albumId = album.id ?? -1
-                    Button {
-                        Task { await environment.toggleAlbumMembership(photoId: currentPhotoId, albumId: albumId) }
-                    } label: {
+                    Toggle(isOn: Binding(
+                        get: { currentPhotoAlbumIds.contains(albumId) },
+                        set: { _ in
+                            Task {
+                                await environment.toggleAlbumMembership(photoId: currentPhotoId, albumId: albumId)
+                                currentPhotoAlbumIds = await environment.albumIds(forPhotoIds: [currentPhotoId])[currentPhotoId] ?? []
+                            }
+                        }
+                    )) {
                         Text(album.name)
                     }
                 }

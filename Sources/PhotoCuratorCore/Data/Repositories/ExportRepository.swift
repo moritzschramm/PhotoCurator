@@ -36,4 +36,21 @@ public enum ExportRepository {
     public static func exports(photoId: Int64, in db: Database) throws -> [ExportRecord] {
         try ExportRecord.filter(ExportRecord.Columns.photoId == photoId).fetchAll(db)
     }
+
+    /// Every export record logged under a given category — used to compute an
+    /// album's export plan (spec: which of its previously-exported photos are no
+    /// longer accepted and need removing from disk).
+    public static func fetchAll(category: String, in db: Database) throws -> [ExportRecord] {
+        try ExportRecord.filter(ExportRecord.Columns.category == category).fetchAll(db)
+    }
+
+    /// Deletes both the log row and its destination file — `deleteExport(id:)` above
+    /// only ever removed the row, which was fine while nothing needed the file gone
+    /// too. Tolerant of the file already being missing (e.g. removed externally).
+    public static func deleteExportAndFile(id: Int64, exportFolderURL: URL, in db: Database) throws {
+        guard let record = try ExportRecord.fetchOne(db, key: id) else { return }
+        let fileURL = exportFolderURL.appendingPathComponent(record.destinationPath)
+        try? FileManager.default.removeItem(at: fileURL)
+        _ = try ExportRecord.deleteOne(db, key: id)
+    }
 }

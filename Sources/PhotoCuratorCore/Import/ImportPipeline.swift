@@ -62,12 +62,34 @@ public actor ImportPipeline {
     /// step 2). Enumeration plus metadata-only EXIF reads — SD cards are local
     /// removable media, so this carries none of the Proton "mass download" risk, but
     /// we still avoid decoding full pixel data just to suggest a subdirectory.
-    public func scan(sourceFolder: URL) async throws -> [ImportGroup] {
+    ///
+    /// `targetLibraryId` decides the *default* per-group subdirectory suggestion: if
+    /// that library already has photos sitting directly in its root, new imports
+    /// default to landing there too (flat) rather than guessing an EXIF-camera-model
+    /// subdirectory — importing into a folder that's already organized flat shouldn't
+    /// start nesting new subdirectories into it. Either way, still overridable per
+    /// group by the caller via `importGroups(chosenSubdirectories:)`.
+    public func scan(sourceFolder: URL, targetLibraryId: Int64) async throws -> [ImportGroup] {
         let files = try DirectoryEnumerator.enumerateFiles(under: sourceFolder)
+        let preferFlatImport = try await database.read { db in
+            try PhotoRepository.libraryHasRootLevelPhotos(libraryId: targetLibraryId, in: db)
+        }
 
+        // Deliberately drops mtime from this match (unlike `ProvisionalKey`'s
+        // other use in `ReconciliationPlanner`, which keeps it — a stricter
+        // match makes sense there since a full content-hash rescue is always
+        // available as a backup for local files). Here, the library-side
+        // counterpart may be online-only and therefore has no content hash on
+        // record at all (`DerivationService` only ever hashes local files), so
+        // filename+size — the two fields least likely to drift between the SD
+        // card's copy and a library copy that arrived by some other route
+        // (e.g. a cloud upload/sync that didn't preserve capture-time mtime) —
+        // is the most reliable signal available without downloading anything.
+        // A same-name, same-byte-size *different* photo is not a realistic risk
+        // for camera-originated RAW/JPEG output.
         let knownProvisionalKeys = try await database.read { db -> Set<ProvisionalKey> in
             let all = try Representation.fetchAll(db)
-            return Set(all.map(ProvisionalKey.init(representation:)))
+            return Set(all.map { ProvisionalKey(filename: $0.filename, fileSize: $0.fileSize, fileMtime: nil) })
         }
 
         var groups: [String: [ImportCandidateFile]] = [:]
@@ -76,7 +98,7 @@ public actor ImportPipeline {
         for file in files {
             guard let kind = RepresentationFileType.kind(forExtension: file.fileExtension) else { continue }
             let basename = ReconciliationPlanner.basename(for: file.filename)
-            let provisional = ProvisionalKey(filename: file.filename, fileSize: file.fileSize, fileMtime: file.fileMtimeEpoch)
+            let provisional = ProvisionalKey(filename: file.filename, fileSize: file.fileSize, fileMtime: nil)
             let candidate = ImportCandidateFile(
                 sourceURL: file.url,
                 kind: kind,
@@ -93,16 +115,18 @@ public actor ImportPipeline {
 
         return order.map { basename in
             let files = groups[basename] ?? []
-            let representative = files.first { !$0.isAlreadyImported } ?? files.first
-            var cameraModel: String?
-            if let representative, let exif = try? ExifExtractor.extract(from: representative.sourceURL) {
-                cameraModel = exif.cameraModel
+            let suggestedSubdirectory: String
+            if preferFlatImport {
+                suggestedSubdirectory = ""
+            } else {
+                let representative = files.first { !$0.isAlreadyImported } ?? files.first
+                var cameraModel: String?
+                if let representative, let exif = try? ExifExtractor.extract(from: representative.sourceURL) {
+                    cameraModel = exif.cameraModel
+                }
+                suggestedSubdirectory = CameraSubdirectoryNaming.suggestedSubdirectory(cameraModel: cameraModel)
             }
-            return ImportGroup(
-                basename: basename,
-                files: files,
-                suggestedSubdirectory: CameraSubdirectoryNaming.suggestedSubdirectory(cameraModel: cameraModel)
-            )
+            return ImportGroup(basename: basename, files: files, suggestedSubdirectory: suggestedSubdirectory)
         }
     }
 
@@ -114,6 +138,7 @@ public actor ImportPipeline {
     public func importGroups(
         _ groups: [ImportGroup],
         chosenSubdirectories: [String: String] = [:],
+        targetLibraryId: Int64,
         protonFolderURL: URL,
         maxConcurrent: Int = 3,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil
@@ -139,6 +164,7 @@ public actor ImportPipeline {
                         basename: entry.basename,
                         file: entry.file,
                         subdirectory: entry.subdirectory,
+                        targetLibraryId: targetLibraryId,
                         protonFolderURL: protonFolderURL
                     )
                 }
@@ -165,6 +191,7 @@ public actor ImportPipeline {
         basename: String,
         file: ImportCandidateFile,
         subdirectory: String,
+        targetLibraryId: Int64,
         protonFolderURL: URL
     ) async -> ImportFileOutcome {
         let fileManager = FileManager.default
@@ -205,6 +232,7 @@ public actor ImportPipeline {
             let representationId = try await database.write { db -> Int64 in
                 let now = Int64(Date().timeIntervalSince1970)
                 let photo = try PhotoRepository.upsertPhoto(
+                    libraryId: targetLibraryId,
                     basename: basename,
                     sourceDir: subdirectory,
                     // Provisional sort key until EXIF derivation backfills the real
@@ -215,6 +243,7 @@ public actor ImportPipeline {
                 )
                 guard let photoId = photo.id else { throw ImportFileError.missingPhotoId }
                 let rep = Representation(
+                    libraryId: targetLibraryId,
                     photoId: photoId,
                     kind: file.kind,
                     relativePath: relativePath,

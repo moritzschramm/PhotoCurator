@@ -1,13 +1,18 @@
 import GRDB
 
-/// Curation status of a shot. "In an album" is NOT a lifecycle state — it is derived
-/// from `photo_albums` membership (see `Album`/`PhotoAlbum`). A photo can be, e.g.,
-/// `published` and in two albums at once.
+/// Review verdict for a shot: unreviewed, or reviewed as accepted/candidate/rejected.
+/// "In an album" is NOT a lifecycle state — it is derived from `photo_albums`
+/// membership (see `Album`/`PhotoAlbum`), and neither is "currently exported" — that's
+/// derived from the `exports` log, since a photo's export status and its review
+/// verdict can independently drift apart (e.g. accepted and exported, then later
+/// downgraded to candidate/rejected without un-exporting it yet). A photo can be
+/// `accepted` and in two albums at once.
 public enum LifecycleState: String, Codable, Sendable, CaseIterable, DatabaseValueConvertible {
     case new
-    case reviewed
+    /// Raw value intentionally left as "reviewed" — same DB string used before this
+    /// was renamed, so no data migration is needed for existing rows.
+    case accepted = "reviewed"
     case candidate
-    case published
     case rejected
 }
 
@@ -15,6 +20,9 @@ public enum LifecycleState: String, Codable, Sendable, CaseIterable, DatabaseVal
 /// more `Representation` rows (RAW and/or JPG).
 public struct Photo: Codable, Equatable, Identifiable, Sendable {
     public var id: Int64?
+    /// Which registered `PhotoLibrary` this photo belongs to — `sourceDir`/`basename`
+    /// uniqueness is scoped per library, not global (see `idx_photos_dir_basename`).
+    public var libraryId: Int64
     public var basename: String
     public var sourceDir: String
     public var captureDate: Int64?
@@ -24,6 +32,7 @@ public struct Photo: Codable, Equatable, Identifiable, Sendable {
 
     public init(
         id: Int64? = nil,
+        libraryId: Int64,
         basename: String,
         sourceDir: String,
         captureDate: Int64? = nil,
@@ -32,6 +41,7 @@ public struct Photo: Codable, Equatable, Identifiable, Sendable {
         updatedAt: Int64
     ) {
         self.id = id
+        self.libraryId = libraryId
         self.basename = basename
         self.sourceDir = sourceDir
         self.captureDate = captureDate
@@ -46,6 +56,7 @@ extension Photo: FetchableRecord, MutablePersistableRecord {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case libraryId = "library_id"
         case basename
         case sourceDir = "source_dir"
         case captureDate = "capture_date"
@@ -62,6 +73,7 @@ extension Photo: FetchableRecord, MutablePersistableRecord {
 extension Photo {
     public enum Columns {
         public static let id = Column(CodingKeys.id)
+        public static let libraryId = Column(CodingKeys.libraryId)
         public static let basename = Column(CodingKeys.basename)
         public static let sourceDir = Column(CodingKeys.sourceDir)
         public static let captureDate = Column(CodingKeys.captureDate)

@@ -1,12 +1,13 @@
 import Foundation
 
 /// Named, keyboard-review-friendly entry points over `Photo.lifecycleState` (spec §6,
-/// §8: "rate/flag/reject"). `new` is only ever set by reconciliation/import and
-/// `published` only by `ExportService` — both are deliberately absent here so the UI
-/// can't assign them directly.
+/// §8: "rate/flag/reject"). `new` is only ever set by reconciliation/import — it's
+/// deliberately absent here so the UI can't assign it directly. "Currently exported"
+/// is tracked separately, in the `exports` log (see `ExportService`), independent of
+/// whichever of these verdicts a photo currently carries.
 public enum LifecycleActions {
-    public static func markReviewed(photoId: Int64, database: AppDatabase) async throws {
-        try await setState(.reviewed, photoIds: [photoId], database: database)
+    public static func markAccepted(photoId: Int64, database: AppDatabase) async throws {
+        try await setState(.accepted, photoIds: [photoId], database: database)
     }
 
     public static func markCandidate(photoId: Int64, database: AppDatabase) async throws {
@@ -17,8 +18,8 @@ public enum LifecycleActions {
         try await setState(.rejected, photoIds: [photoId], database: database)
     }
 
-    public static func markReviewed(photoIds: [Int64], database: AppDatabase) async throws {
-        try await setState(.reviewed, photoIds: photoIds, database: database)
+    public static func markAccepted(photoIds: [Int64], database: AppDatabase) async throws {
+        try await setState(.accepted, photoIds: photoIds, database: database)
     }
 
     public static func markCandidate(photoIds: [Int64], database: AppDatabase) async throws {

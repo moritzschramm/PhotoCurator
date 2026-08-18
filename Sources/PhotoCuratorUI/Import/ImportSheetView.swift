@@ -7,17 +7,30 @@ import PhotoCuratorCore
 struct ImportSheetView: View {
     let sourceFolderURL: URL
     let displayName: String
+    let defaultLibraryId: Int64?
 
     @Environment(AppEnvironment.self) private var environment
     @Environment(\.dismiss) private var dismiss
 
+    @State private var selectedLibraryId: Int64?
     @State private var groups: [ImportGroup] = []
     @State private var subdirectoryOverrides: [String: String] = [:]
+    /// Groups the user has unchecked — everything importable is ticked by default,
+    /// so this tracks the exceptions rather than needing to pre-populate a "selected"
+    /// set for every group as they're discovered.
+    @State private var deselectedBasenames: Set<String> = []
     @State private var isScanning = true
     @State private var scanError: String?
     @State private var isImporting = false
     @State private var importProgress = (done: 0, total: 0)
     @State private var importResults: [ImportFileOutcome]?
+
+    init(sourceFolderURL: URL, displayName: String, defaultLibraryId: Int64?) {
+        self.sourceFolderURL = sourceFolderURL
+        self.displayName = displayName
+        self.defaultLibraryId = defaultLibraryId
+        _selectedLibraryId = State(initialValue: defaultLibraryId)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,15 +41,28 @@ struct ImportSheetView: View {
             footer
         }
         .frame(width: 640, height: 520)
-        .task { await scan() }
+        // Re-scans when the destination library changes — subdirectory suggestions
+        // (flat vs. per-camera) depend on what that specific library already
+        // contains (see `ImportPipeline.scan`'s `preferFlatImport`).
+        .task(id: selectedLibraryId) { await scan() }
     }
 
     private var header: some View {
-        HStack {
-            Image(systemName: "sdcard")
-            Text("Import from \(displayName)")
-                .font(.headline)
-            Spacer()
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "sdcard")
+                Text("Import from \(displayName)")
+                    .font(.headline)
+                Spacer()
+            }
+            if environment.folderAccess.photoLibraries.count > 1 {
+                Picker("Import into:", selection: $selectedLibraryId) {
+                    ForEach(environment.folderAccess.photoLibraries) { library in
+                        Text(library.name).tag(Optional(library.id))
+                    }
+                }
+                .frame(maxWidth: 320)
+            }
         }
         .padding()
     }
@@ -72,6 +98,10 @@ struct ImportSheetView: View {
     private var groupsList: some View {
         List(groups) { group in
             HStack {
+                if !group.isFullyDuplicate {
+                    Toggle("", isOn: selectionBinding(for: group))
+                        .labelsHidden()
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(group.basename)
                     Text(group.files.map(\.filename).joined(separator: ", "))
@@ -84,11 +114,13 @@ struct ImportSheetView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    TextField("Subdirectory", text: subdirectoryBinding(for: group))
+                    TextField("Subdirectory (optional)", text: subdirectoryBinding(for: group))
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 200)
+                        .disabled(isDeselected(group))
                 }
             }
+            .opacity(isDeselected(group) ? 0.5 : 1)
         }
     }
 
@@ -138,8 +170,31 @@ struct ImportSheetView: View {
         .padding()
     }
 
+    /// Only counts groups that are both importable (not already-duplicate) and still
+    /// ticked — the footer/Import-button-enabled count should reflect what will
+    /// actually be imported, not just what's technically available.
     private var newFileCount: Int {
-        groups.reduce(0) { $0 + $1.newFileCount }
+        groups.reduce(0) { total, group in
+            guard !isDeselected(group) else { return total }
+            return total + group.newFileCount
+        }
+    }
+
+    private func isDeselected(_ group: ImportGroup) -> Bool {
+        deselectedBasenames.contains(group.basename)
+    }
+
+    private func selectionBinding(for group: ImportGroup) -> Binding<Bool> {
+        Binding(
+            get: { !deselectedBasenames.contains(group.basename) },
+            set: { isSelected in
+                if isSelected {
+                    deselectedBasenames.remove(group.basename)
+                } else {
+                    deselectedBasenames.insert(group.basename)
+                }
+            }
+        )
     }
 
     private func subdirectoryBinding(for group: ImportGroup) -> Binding<String> {
@@ -150,9 +205,18 @@ struct ImportSheetView: View {
     }
 
     private func scan() async {
+        guard let selectedLibraryId else {
+            scanError = "No photo library to import into."
+            isScanning = false
+            return
+        }
         isScanning = true
+        // A fresh scan means a fresh set of groups — stale basenames from a
+        // previous scan (e.g. after switching the destination library) shouldn't
+        // silently deselect an unrelated group that happens to share a name.
+        deselectedBasenames = []
         do {
-            groups = try await environment.scanImportCandidates(sourceFolder: sourceFolderURL)
+            groups = try await environment.scanImportCandidates(sourceFolder: sourceFolderURL, targetLibraryId: selectedLibraryId)
         } catch {
             scanError = "Could not scan \(displayName): \(error.localizedDescription)"
         }
@@ -160,10 +224,13 @@ struct ImportSheetView: View {
     }
 
     private func runImport() async {
+        guard let selectedLibraryId else { return }
         isImporting = true
+        let selectedGroups = groups.filter { !isDeselected($0) }
         importResults = await environment.runImport(
-            groups: groups,
+            groups: selectedGroups,
             subdirectoryOverrides: subdirectoryOverrides,
+            targetLibraryId: selectedLibraryId,
             onProgress: { done, total in
                 Task { @MainActor in importProgress = (done, total) }
             }

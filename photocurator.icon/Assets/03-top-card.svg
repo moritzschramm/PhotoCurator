@@ -1,0 +1,31 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-label="Top card layer">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E8F0FF"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFF0C2"/>
+      <stop offset="1" stop-color="#FFC24D"/>
+    </radialGradient>
+    <linearGradient id="ridge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6E8FEA"/>
+      <stop offset="1" stop-color="#3B54BE"/>
+    </linearGradient>
+    <linearGradient id="ridgeBack" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#A9C0F5"/>
+      <stop offset="1" stop-color="#7E9AEC"/>
+    </linearGradient>
+    <clipPath id="topCardClip">
+      <rect x="300" y="250" width="470" height="540" rx="52"/>
+    </clipPath>
+  </defs>
+  <g transform="rotate(-2 512 520)">
+    <rect x="300" y="250" width="470" height="540" rx="52" fill="url(#card)"/>
+    <g clip-path="url(#topCardClip)">
+      <circle cx="430" cy="392" r="54" fill="url(#sun)"/>
+      <path d="M300 700 L470 512 L600 636 L720 470 L770 560 L770 790 L300 790 Z" fill="url(#ridgeBack)"/>
+      <path d="M300 790 L300 690 L440 548 L560 660 L690 500 L770 600 L770 790 Z" fill="url(#ridge)"/>
+    </g>
+  </g>
+</svg>

@@ -1,9 +1,9 @@
 # PhotoCurator
 
-A native macOS app for reviewing camera photos synced through a Proton Drive folder,
-curating them into albums, and exporting selected JPGs to a website gallery target.
-Implements `specification.md` in full — see that file for the authoritative behavior spec;
-this README covers how the implementation is organized and how to build/run/test it.
+A native macOS app for reviewing camera photos synced through a directory,
+curating them into albums, and exporting selected JPGs to a gallery target.
+Implements `specification.md` in full (see that file for the authoritative behavior spec).
+This README covers how the implementation is organized and how to build/run/test it.
 
 - DISCLAIMER: this project was fully implemented by Claude Code
 
@@ -45,8 +45,7 @@ development.
 Three SwiftPM targets, following spec §10:
 
 - **`PhotoCuratorCore`** — everything except UI. No SwiftUI/AppKit dependency other
-  than `AppKit` for `NSWorkspace`/`DiskArbitration` mount detection and `CoreImage`/
-  `ImageIO` for rendering, so it stays independently testable.
+  than `CoreImage`/`ImageIO` for rendering, so it stays independently testable.
   - `Data/` — GRDB records (`Models/`), `Repositories/` (plain functions over an open
     `Database`, no threading concerns of their own), `AppMigrations`, `AppDatabase`
     (owns the `DatabasePool`), `SnapshotService` (`VACUUM INTO` backups).
@@ -72,4 +71,4 @@ Three SwiftPM targets, following spec §10:
 constraints), identity (content hashing against direct CryptoKit computation,
 provisional-key equality), the reconciliation diff in isolation, and an
 integration suite that runs `ReconciliationService` against real files in a temp
-directory (new/unchanged/moved/removed, idempotency). 40 tests, all passing.
+directory (new/unchanged/moved/removed, idempotency).

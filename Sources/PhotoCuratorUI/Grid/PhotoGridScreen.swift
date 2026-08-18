@@ -2,7 +2,8 @@ import SwiftUI
 import PhotoCuratorCore
 
 /// One of the app's three primary surfaces (spec §8): a large, zoomable, virtualized
-/// grid — either the whole library or one album.
+/// grid — the whole library, one specific library, reviewed-but-uncategorized
+/// photos, or one album.
 struct PhotoGridScreen: View {
     let scope: GridScope
 
@@ -12,12 +13,22 @@ struct PhotoGridScreen: View {
     @State private var thumbnailSize: CGFloat = 160
     @State private var selection: Set<Int64> = []
     @State private var showingExportSheet = false
+    /// Which albums each currently-selected photo already belongs to — refreshed
+    /// whenever the selection changes, so the "Add to Album" menu can show a
+    /// checkmark without a database round-trip on every menu open.
+    @State private var selectionAlbumIds: [Int64: Set<Int64>] = [:]
 
     private var entries: [PhotoGridEntry] {
         switch scope {
-        case .library: return environment.gridEntries
+        case .library(let id): return environment.gridEntries(libraryId: id)
+        case .unassigned: return environment.unassignedGridEntries
         case .album: return albumStore.entries
         }
+    }
+
+    private var isAlbumScope: Bool {
+        if case .album = scope { return true }
+        return false
     }
 
     var body: some View {
@@ -25,9 +36,14 @@ struct PhotoGridScreen: View {
             entries: entries,
             itemSize: thumbnailSize,
             selection: $selection,
+            isReorderingEnabled: isAlbumScope,
             onOpen: { id in navigator.openPhoto(id, scope: scope) },
             onZoomDelta: { delta in
                 thumbnailSize = (thumbnailSize * (1 + delta)).clamped(to: 80...360)
+            },
+            onReorder: { newOrder in
+                guard case .album(let albumId) = scope else { return }
+                Task { await environment.reorderAlbumPhotos(albumId: albumId, orderedPhotoIds: newOrder) }
             }
         )
         .navigationTitle(title)
@@ -36,15 +52,23 @@ struct PhotoGridScreen: View {
                 albumStore.start(albumId: albumId, database: environment.database)
             }
         }
+        .task(id: selection) {
+            selectionAlbumIds = selection.isEmpty ? [:] : await environment.albumIds(forPhotoIds: Array(selection))
+        }
         .toolbar { toolbarContent }
         .sheet(isPresented: $showingExportSheet) {
-            ExportSheetView(photoIds: Array(selection), defaultCategory: defaultCategory)
+            if case .album(let albumId) = scope {
+                AlbumExportSheetView(albumId: albumId, category: defaultCategory)
+            }
         }
     }
 
     private var title: String {
         switch scope {
-        case .library: return "Library"
+        case .library(let id):
+            guard let id else { return "All Libraries" }
+            return environment.folderAccess.photoLibraries.first { $0.id == id }?.name ?? "Library"
+        case .unassigned: return "Unassigned Photos"
         case .album(let id): return environment.albums.first { $0.id == id }?.name ?? "Album"
         }
     }
@@ -54,6 +78,13 @@ struct PhotoGridScreen: View {
             return environment.albums.first { $0.id == id }?.name ?? ""
         }
         return ""
+    }
+
+    /// Whether every currently-selected photo already belongs to `albumId` — used
+    /// both to render the "Add to Album" menu's checkmark and to decide whether
+    /// choosing it should add or remove the whole selection.
+    private func isSelectionFullyInAlbum(_ albumId: Int64) -> Bool {
+        !selection.isEmpty && selection.allSatisfy { selectionAlbumIds[$0]?.contains(albumId) ?? false }
     }
 
     @ToolbarContentBuilder
@@ -78,35 +109,46 @@ struct PhotoGridScreen: View {
             .help("Reject (X)")
 
             Button {
-                Task { await environment.setLifecycle(photoIds: Array(selection), state: .reviewed) }
+                Task { await environment.setLifecycle(photoIds: Array(selection), state: .accepted) }
             } label: {
-                Label("Reviewed", systemImage: "checkmark")
+                Label("Accept", systemImage: "checkmark")
             }
             .keyboardShortcut("u", modifiers: [])
             .disabled(selection.isEmpty)
-            .help("Mark as reviewed (U)")
+            .help("Mark as accepted (U)")
 
             Menu {
                 ForEach(environment.albums) { album in
-                    Button(album.name) {
-                        Task {
-                            for id in selection {
-                                await environment.toggleAlbumMembership(photoId: id, albumId: album.id ?? -1)
+                    let albumId = album.id ?? -1
+                    let allMembers = isSelectionFullyInAlbum(albumId)
+                    Toggle(isOn: Binding(
+                        get: { allMembers },
+                        set: { _ in
+                            Task {
+                                await environment.toggleAlbumMembershipForSelection(
+                                    photoIds: Array(selection), albumId: albumId, allAreMembers: allMembers
+                                )
                             }
                         }
+                    )) {
+                        Text(album.name)
                     }
                 }
             } label: {
                 Label("Add to Album", systemImage: "square.stack.3d.up")
             }
             .disabled(selection.isEmpty || environment.albums.isEmpty)
+        }
 
-            Button {
-                showingExportSheet = true
-            } label: {
-                Label("Export…", systemImage: "square.and.arrow.up")
+        if case .album = scope {
+            ToolbarItem {
+                Button("Export") {
+                    showingExportSheet = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+                .help("Review and export this album's accepted photos")
             }
-            .disabled(selection.isEmpty)
         }
 
         ToolbarItem {
