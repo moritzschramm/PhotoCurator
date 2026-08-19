@@ -32,6 +32,10 @@ public final class AppEnvironment {
     public let importPipeline: ImportPipeline
     public let exportService: ExportService
 
+    public let undoManager = UndoManager()
+    public private(set) var canUndo = false
+    public private(set) var canRedo = false
+
     public var launchPhase: LaunchPhase = .notStarted
     public var folderAccess = FolderAccessStatus(photoLibraries: [], exportTarget: nil)
     public var gridEntries: [PhotoGridEntry] = []
@@ -72,6 +76,11 @@ public final class AppEnvironment {
     private var snapshotDebounceTask: Task<Void, Never>?
     private var accessStartedURLs: [URL] = []
     private var hasStartedBootstrap = false
+    /// Chains actual undo/redo mutation work sequentially — `canUndo`/`canRedo` only
+    /// gate the menu's affordance, so anything that calls `undo()`/`redo()` twice in
+    /// quick succession (a fast repeated keypress, a script) must still have both
+    /// steps apply in order, not race or silently drop the second one.
+    private var undoRedoQueueTail: Task<Void, Never>?
 
     public init() throws {
         let db = try AppDatabase.openDefault()
@@ -85,6 +94,57 @@ public final class AppEnvironment {
         derivationQueue = queue
         importPipeline = ImportPipeline(database: db, derivationService: derivation)
         exportService = ExportService(database: db, derivationQueue: queue)
+
+        // Our registrations always happen well after the triggering NSEvent's own
+        // extent (several run-loop turns removed, inside an already-awaited async
+        // method), so Foundation's default event-based grouping has nothing
+        // meaningful to key off — disabling it makes grouping fully deterministic.
+        undoManager.groupsByEvent = false
+        // Foundation defaults to unlimited; a "Remove Library" undo snapshot can hold
+        // a large library's full row set in memory for the life of the stack.
+        undoManager.levelsOfUndo = 25
+
+        let undoManagerRef = undoManager
+        NotificationCenter.default.addObserver(forName: .NSUndoManagerCheckpoint, object: undoManagerRef, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshUndoRedoState() }
+        }
+        NotificationCenter.default.addObserver(forName: .NSUndoManagerDidUndoChange, object: undoManagerRef, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshUndoRedoState() }
+        }
+        NotificationCenter.default.addObserver(forName: .NSUndoManagerDidRedoChange, object: undoManagerRef, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshUndoRedoState() }
+        }
+    }
+
+    private func refreshUndoRedoState() {
+        canUndo = undoManager.canUndo
+        canRedo = undoManager.canRedo
+    }
+
+    /// Registers an undo/redo pair for a mutation this method just performed. See
+    /// `UndoManager.registerReversiblePair` for the synchronous-registration/
+    /// deferred-mutation split this relies on to keep undo/redo "ping-pong" correct.
+    private func registerUndo(
+        name: String,
+        undo: @escaping @MainActor @Sendable (AppEnvironment) async -> Void,
+        redo: @escaping @MainActor @Sendable (AppEnvironment) async -> Void
+    ) {
+        undoManager.registerReversiblePair(
+            withTarget: self,
+            actionName: name,
+            undo: { env in await env.runSerializedUndoRedo { await undo(env) } },
+            redo: { env in await env.runSerializedUndoRedo { await redo(env) } }
+        )
+    }
+
+    private func runSerializedUndoRedo(_ work: @escaping @MainActor @Sendable () async -> Void) async {
+        let previous = undoRedoQueueTail
+        let task = Task { @MainActor in
+            _ = await previous?.value
+            await work()
+        }
+        undoRedoQueueTail = task
+        await task.value
     }
 
     // MARK: Launch sequence
@@ -121,7 +181,11 @@ public final class AppEnvironment {
             if library.name == "Photo Library" {
                 let actualName = library.url.lastPathComponent
                 if actualName != library.name {
-                    await renamePhotoLibrary(id: library.id, name: actualName)
+                    // Not routed through the public `renamePhotoLibrary` — this is an
+                    // automatic one-time migration fixup, not a user action, and
+                    // shouldn't push a surprise "Rename Library" entry onto the undo
+                    // stack the moment the app launches.
+                    await applyRenamePhotoLibrary(id: library.id, name: actualName)
                 }
             }
         }
@@ -161,6 +225,28 @@ public final class AppEnvironment {
     /// whether it succeeded, so the caller can surface an error inline.
     @discardableResult
     public func changeExportTarget(bookmarkData: Data) async -> Bool {
+        // Captured as raw `Data`, not the current `SecurityScopedFolder` object —
+        // the forward action below is about to release that object's security scope,
+        // so undo must re-resolve a fresh grant from the bookmark bytes rather than
+        // reuse an already-stopped one.
+        let previousBookmarkData = try? await database.read { db in
+            try AppStateRepository.getData(AppStateKey.exportFolderBookmark, in: db)
+        }
+        guard await applyChangeExportTarget(bookmarkData: bookmarkData) else { return false }
+
+        registerUndo(
+            name: "Change Export Folder",
+            undo: { env in
+                guard let previousBookmarkData else { return }
+                _ = await env.applyChangeExportTarget(bookmarkData: previousBookmarkData)
+            },
+            redo: { env in _ = await env.applyChangeExportTarget(bookmarkData: bookmarkData) }
+        )
+        return true
+    }
+
+    @discardableResult
+    private func applyChangeExportTarget(bookmarkData: Data) async -> Bool {
         let oldExportTarget = folderAccess.exportTarget
         do {
             try await BookmarkStore.saveExportBookmarkData(bookmarkData, database: database)
@@ -185,47 +271,100 @@ public final class AppEnvironment {
     /// Libraries" list) can surface an error inline.
     @discardableResult
     public func addPhotoLibrary(bookmarkData: Data, name: String) async -> Bool {
-        do {
-            let library = try await database.write { db in
-                try PhotoLibraryRepository.create(name: name, bookmarkData: bookmarkData, now: Int64(Date().timeIntervalSince1970), in: db)
-            }
-            guard let id = library.id else { return false }
-            var isStale = false
-            let folder = SecurityScopedFolder(url: try URL(
-                resolvingBookmarkData: bookmarkData,
-                options: .withSecurityScope,
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            ))
-            beginPersistentAccess(folder)
-            let libraryFolder = PhotoLibraryFolder(id: id, name: name, folder: folder)
-            folderAccess.photoLibraries.append(libraryFolder)
+        guard let library = try? await database.write({ db in
+            try PhotoLibraryRepository.create(name: name, bookmarkData: bookmarkData, now: Int64(Date().timeIntervalSince1970), in: db)
+        }), let id = library.id else { return false }
+        guard await applyAttachNewLibrary(id: id, name: name, bookmarkData: bookmarkData) else { return false }
 
-            if folderAccess.isFullyGranted, launchPhase == .ready {
-                // Already up and running — index just the new library in the
-                // background rather than re-scanning every already-registered one.
-                startBackgroundReconcile(photoLibraries: [LibrarySource(id: id, url: libraryFolder.url)])
-            } else if folderAccess.isFullyGranted {
-                await proceedPastGate()
+        // Threads a snapshot between this ping-ponging pair: undo captures the
+        // library's state fresh, right before deleting it — so anything
+        // reconciliation found for it between the original add and the undo isn't
+        // lost — and redo restores whatever undo most recently captured, not the
+        // empty state from the moment of creation.
+        let snapshotBox = LibrarySnapshotBox()
+        registerUndo(
+            name: "Add Library",
+            undo: { env in snapshotBox.snapshot = await env.applyDeleteLibrary(id: id) },
+            redo: { env in
+                guard let snapshot = snapshotBox.snapshot else { return }
+                _ = await env.applyRestoreLibrary(snapshot)
             }
-            return true
-        } catch {
-            return false
-        }
+        )
+        return true
     }
 
     public func removePhotoLibrary(id: Int64) async {
+        guard let snapshot = await applyDeleteLibrary(id: id) else { return }
+        registerUndo(
+            name: "Remove Library",
+            undo: { env in _ = await env.applyRestoreLibrary(snapshot) },
+            redo: { env in _ = await env.applyDeleteLibrary(id: id) }
+        )
+    }
+
+    /// Deletes a library, capturing and returning everything it held so a
+    /// subsequent undo can bring it back exactly.
+    @discardableResult
+    private func applyDeleteLibrary(id: Int64) async -> PhotoLibrarySnapshot? {
+        guard let snapshot = try? await database.read({ db in try PhotoLibraryRepository.snapshot(id: id, in: db) }) else { return nil }
         _ = try? await database.write { db in try PhotoLibraryRepository.delete(id: id, in: db) }
         folderAccess.photoLibraries.removeAll { $0.id == id }
+        return snapshot
+    }
+
+    /// Restores a full snapshot's rows, then reattaches its folder — used by
+    /// undo-of-remove and redo-of-add.
+    @discardableResult
+    private func applyRestoreLibrary(_ snapshot: PhotoLibrarySnapshot) async -> Bool {
+        _ = try? await database.write { db in try PhotoLibraryRepository.restore(snapshot, in: db) }
+        return await applyAttachNewLibrary(id: snapshot.library.id, name: snapshot.library.name, bookmarkData: snapshot.library.bookmarkData)
+    }
+
+    /// Resolves a library's bookmark into a fresh security-scoped grant and wires it
+    /// into `folderAccess`/reconciliation — the common tail shared by a brand-new
+    /// `addPhotoLibrary` call and a snapshot-based restore.
+    @discardableResult
+    private func applyAttachNewLibrary(id: Int64?, name: String, bookmarkData: Data) async -> Bool {
+        guard let id else { return false }
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: bookmarkData, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale
+        ) else { return false }
+        let folder = SecurityScopedFolder(url: url)
+        beginPersistentAccess(folder)
+        let libraryFolder = PhotoLibraryFolder(id: id, name: name, folder: folder)
+        if !folderAccess.photoLibraries.contains(where: { $0.id == id }) {
+            folderAccess.photoLibraries.append(libraryFolder)
+        }
+
+        if folderAccess.isFullyGranted, launchPhase == .ready {
+            // Already up and running — index just this library in the background
+            // rather than re-scanning every already-registered one.
+            startBackgroundReconcile(photoLibraries: [LibrarySource(id: id, url: libraryFolder.url)])
+        } else if folderAccess.isFullyGranted {
+            await proceedPastGate()
+        }
+        return true
     }
 
     public func renamePhotoLibrary(id: Int64, name: String) async {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        _ = try? await database.write { db in try PhotoLibraryRepository.rename(id: id, name: trimmed, in: db) }
+        guard let previousName = folderAccess.photoLibraries.first(where: { $0.id == id })?.name, previousName != trimmed else { return }
+
+        await applyRenamePhotoLibrary(id: id, name: trimmed)
+        registerUndo(
+            name: "Rename Library",
+            undo: { env in await env.applyRenamePhotoLibrary(id: id, name: previousName) },
+            redo: { env in await env.applyRenamePhotoLibrary(id: id, name: trimmed) }
+        )
+    }
+
+    private func applyRenamePhotoLibrary(id: Int64, name: String) async {
+        _ = try? await database.write { db in try PhotoLibraryRepository.rename(id: id, name: name, in: db) }
         if let index = folderAccess.photoLibraries.firstIndex(where: { $0.id == id }) {
             let existing = folderAccess.photoLibraries[index]
-            folderAccess.photoLibraries[index] = PhotoLibraryFolder(id: id, name: trimmed, folder: existing.folder)
+            folderAccess.photoLibraries[index] = PhotoLibraryFolder(id: id, name: name, folder: existing.folder)
         }
     }
 
@@ -360,18 +499,56 @@ public final class AppEnvironment {
 
     public func setLifecycle(photoIds: [Int64], state: LifecycleState) async {
         guard !photoIds.isEmpty else { return }
+        let previousStates = (try? await database.read { db in
+            try PhotoRepository.fetchLifecycleStates(photoIds: photoIds, in: db)
+        }) ?? [:]
+        guard await applyLifecycleState(state, to: photoIds) else { return }
+
+        registerUndo(
+            name: "Set Lifecycle",
+            undo: { env in await env.applyLifecycleStates(previousStates) },
+            redo: { env in _ = await env.applyLifecycleState(state, to: photoIds) }
+        )
+    }
+
+    @discardableResult
+    private func applyLifecycleState(_ state: LifecycleState, to photoIds: [Int64]) async -> Bool {
         do {
             switch state {
             case .accepted: try await LifecycleActions.markAccepted(photoIds: photoIds, database: database)
             case .candidate: try await LifecycleActions.markCandidate(photoIds: photoIds, database: database)
             case .rejected: try await LifecycleActions.markRejected(photoIds: photoIds, database: database)
-            case .new: break // system-only state, not user-assignable
+            case .new: try await LifecycleActions.markUnreviewed(photoIds: photoIds, database: database)
             }
-            scheduleSnapshotSoon()
-        } catch { }
+        } catch { return false }
+        scheduleSnapshotSoon()
+        return true
+    }
+
+    /// Restores a mixed-state selection to each photo's own individual prior state
+    /// (not one shared "previous state" — a multi-select undo can start from a mix
+    /// of accepted/candidate/rejected/new).
+    private func applyLifecycleStates(_ states: [Int64: LifecycleState]) async {
+        let idsByState = Dictionary(grouping: states.keys, by: { states[$0]! })
+        for (state, ids) in idsByState {
+            _ = try? await database.write { db in
+                try PhotoRepository.setLifecycleState(photoIds: Array(ids), state: state, now: Int64(Date().timeIntervalSince1970), in: db)
+            }
+        }
+        scheduleSnapshotSoon()
     }
 
     public func toggleAlbumMembership(photoId: Int64, albumId: Int64) async {
+        await applyToggleAlbumMembership(photoId: photoId, albumId: albumId)
+        registerUndo(
+            name: "Toggle Album Membership",
+            // Self-inverse: toggling again exactly reverses it either direction.
+            undo: { env in await env.applyToggleAlbumMembership(photoId: photoId, albumId: albumId) },
+            redo: { env in await env.applyToggleAlbumMembership(photoId: photoId, albumId: albumId) }
+        )
+    }
+
+    private func applyToggleAlbumMembership(photoId: Int64, albumId: Int64) async {
         _ = try? await database.write { db in
             try AlbumRepository.toggleMembership(photoId: photoId, albumId: albumId, now: Int64(Date().timeIntervalSince1970), in: db)
         }
@@ -384,8 +561,33 @@ public final class AppEnvironment {
     /// whatever's already there (see `AlbumRepository.addPhotos`).
     public func addPhotosToAlbum(photoIds: [Int64], albumId: Int64) async {
         guard !photoIds.isEmpty else { return }
+        // `addPhotos` is idempotent and only actually adds photos not already a
+        // member — undo must remove exactly that subset, not every id passed in,
+        // since some may have been pre-existing members that must stay.
+        let existingMemberIds = (try? await database.read { db in
+            try AlbumRepository.albumIds(photoIds: photoIds, in: db)
+        }) ?? [:]
+        let newlyAddedIds = photoIds.filter { !(existingMemberIds[$0]?.contains(albumId) ?? false) }
+        guard !newlyAddedIds.isEmpty else { return }
+
+        await applyAddPhotos(newlyAddedIds, albumId: albumId)
+        registerUndo(
+            name: "Add to Album",
+            undo: { env in await env.applyRemovePhotos(newlyAddedIds, albumId: albumId) },
+            redo: { env in await env.applyAddPhotos(newlyAddedIds, albumId: albumId) }
+        )
+    }
+
+    private func applyAddPhotos(_ photoIds: [Int64], albumId: Int64) async {
         _ = try? await database.write { db in
             try AlbumRepository.addPhotos(photoIds: photoIds, albumId: albumId, now: Int64(Date().timeIntervalSince1970), in: db)
+        }
+        scheduleSnapshotSoon()
+    }
+
+    private func applyRemovePhotos(_ photoIds: [Int64], albumId: Int64) async {
+        _ = try? await database.write { db in
+            try AlbumRepository.removePhotos(photoIds: photoIds, albumId: albumId, in: db)
         }
         scheduleSnapshotSoon()
     }
@@ -403,18 +605,40 @@ public final class AppEnvironment {
     /// needed to render the checkmark in the first place.
     public func toggleAlbumMembershipForSelection(photoIds: [Int64], albumId: Int64, allAreMembers: Bool) async {
         guard !photoIds.isEmpty else { return }
-        _ = try? await database.write { db in
-            if allAreMembers {
-                try AlbumRepository.removePhotos(photoIds: photoIds, albumId: albumId, in: db)
-            } else {
-                try AlbumRepository.addPhotos(photoIds: photoIds, albumId: albumId, now: Int64(Date().timeIntervalSince1970), in: db)
-            }
+        if allAreMembers {
+            await applyRemovePhotos(photoIds, albumId: albumId)
+        } else {
+            await applyAddPhotos(photoIds, albumId: albumId)
         }
-        scheduleSnapshotSoon()
+        registerUndo(
+            name: "Toggle Album Membership",
+            undo: { env in
+                if allAreMembers { await env.applyAddPhotos(photoIds, albumId: albumId) }
+                else { await env.applyRemovePhotos(photoIds, albumId: albumId) }
+            },
+            redo: { env in
+                if allAreMembers { await env.applyRemovePhotos(photoIds, albumId: albumId) }
+                else { await env.applyAddPhotos(photoIds, albumId: albumId) }
+            }
+        )
     }
 
     /// Persists a drag-and-drop reorder within an album's browse grid.
     public func reorderAlbumPhotos(albumId: Int64, orderedPhotoIds: [Int64]) async {
+        let previousOrder = (try? await database.read { db in
+            try AlbumRepository.orderedPhotoIds(albumId: albumId, in: db)
+        }) ?? []
+        guard previousOrder != orderedPhotoIds else { return }
+
+        await applyReorder(albumId: albumId, orderedPhotoIds: orderedPhotoIds)
+        registerUndo(
+            name: "Reorder Album",
+            undo: { env in await env.applyReorder(albumId: albumId, orderedPhotoIds: previousOrder) },
+            redo: { env in await env.applyReorder(albumId: albumId, orderedPhotoIds: orderedPhotoIds) }
+        )
+    }
+
+    private func applyReorder(albumId: Int64, orderedPhotoIds: [Int64]) async {
         _ = try? await database.write { db in
             try AlbumRepository.reorderPhotos(albumId: albumId, orderedPhotoIds: orderedPhotoIds, in: db)
         }
@@ -423,22 +647,60 @@ public final class AppEnvironment {
 
     @discardableResult
     public func createAlbum(name: String) async -> Album? {
-        let album = try? await database.write { db in
+        guard let album = try? await database.write({ db in
             try AlbumRepository.createAlbum(name: name, now: Int64(Date().timeIntervalSince1970), in: db)
-        }
+        }) else { return nil }
         scheduleSnapshotSoon()
+
+        registerUndo(
+            name: "Create Album",
+            undo: { env in await env.applyDeleteAlbum(id: album.id ?? -1) },
+            redo: { env in await env.applyRestoreAlbum(album, memberships: []) }
+        )
         return album
     }
 
     public func deleteAlbum(id: Int64) async {
+        guard let album = try? await database.read({ db in try AlbumRepository.fetchAlbum(id: id, in: db) }) else { return }
+        let memberships = (try? await database.read { db in try AlbumRepository.fetchMemberships(albumId: id, in: db) }) ?? []
+
+        await applyDeleteAlbum(id: id)
+        registerUndo(
+            name: "Delete Album",
+            undo: { env in await env.applyRestoreAlbum(album, memberships: memberships) },
+            redo: { env in await env.applyDeleteAlbum(id: id) }
+        )
+    }
+
+    private func applyDeleteAlbum(id: Int64) async {
         _ = try? await database.write { db in try AlbumRepository.deleteAlbum(id: id, in: db) }
+        scheduleSnapshotSoon()
+    }
+
+    private func applyRestoreAlbum(_ album: Album, memberships: [PhotoAlbum]) async {
+        _ = try? await database.write { db in
+            try AlbumRepository.restore(album, in: db)
+            try AlbumRepository.restore(memberships, in: db)
+        }
         scheduleSnapshotSoon()
     }
 
     public func renameAlbum(id: Int64, name: String) async {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        _ = try? await database.write { db in try AlbumRepository.renameAlbum(id: id, name: trimmed, in: db) }
+        guard let previousName = try? await database.read({ db in try AlbumRepository.fetchAlbum(id: id, in: db)?.name }) else { return }
+        guard previousName != trimmed else { return }
+
+        await applyRenameAlbum(id: id, name: trimmed)
+        registerUndo(
+            name: "Rename Album",
+            undo: { env in await env.applyRenameAlbum(id: id, name: previousName) },
+            redo: { env in await env.applyRenameAlbum(id: id, name: trimmed) }
+        )
+    }
+
+    private func applyRenameAlbum(id: Int64, name: String) async {
+        _ = try? await database.write { db in try AlbumRepository.renameAlbum(id: id, name: name, in: db) }
         scheduleSnapshotSoon()
     }
 
@@ -467,7 +729,71 @@ public final class AppEnvironment {
         Task.detached(priority: .utility) {
             await queue.processLocalBacklog(photoRoots: [targetLibraryId: targetLibraryRootURL])
         }
+
+        let records = outcomes.compactMap(\.undoInfo)
+        if !records.isEmpty {
+            let batch = ImportUndoBatch(records: records)
+            registerUndo(
+                name: "Import Photos",
+                undo: { env in await env.undoImportBatch(batch) },
+                redo: { env in await env.redoImportBatch(batch, targetLibraryId: targetLibraryId, protonFolderURL: targetLibraryRootURL) }
+            )
+        }
         return outcomes
+    }
+
+    /// Trashes every imported file in the batch and removes its representation row,
+    /// deleting the shared photo row too if that was its last remaining
+    /// representation — `deletePhotoIfEmpty`'s own remaining-count check decides
+    /// this per record, not which side originally created it (see `ImportUndoRecord`).
+    private func undoImportBatch(_ batch: ImportUndoBatch) async {
+        for record in batch.records {
+            guard let representationId = record.representation.id else { continue }
+            if let trashedURL = try? TrashDisposal.moveToTrash(record.destinationFileURL) {
+                batch.trashedURLs[representationId] = trashedURL
+            }
+        }
+        _ = try? await database.write { db in
+            for record in batch.records {
+                guard let representationId = record.representation.id else { continue }
+                try PhotoRepository.deleteRepresentation(id: representationId, in: db)
+                if let deletedPhoto = try PhotoRepository.deletePhotoIfEmpty(photoId: record.representation.photoId, in: db) {
+                    batch.deletedPhotos[record.representation.photoId] = deletedPhoto
+                }
+            }
+        }
+        scheduleSnapshotSoon()
+    }
+
+    /// Restores whatever `undoImportBatch` most recently trashed/deleted — skips a
+    /// record entirely (file and row) if its trashed file no longer exists, e.g. the
+    /// user emptied Trash mid-session, rather than reinserting a row that points at
+    /// nothing.
+    private func redoImportBatch(_ batch: ImportUndoBatch, targetLibraryId: Int64, protonFolderURL: URL) async {
+        var restoredIdsBuilder: Set<Int64> = []
+        for record in batch.records {
+            guard let representationId = record.representation.id,
+                  let trashedURL = batch.trashedURLs[representationId],
+                  FileManager.default.fileExists(atPath: trashedURL.path) else { continue }
+            guard (try? TrashDisposal.restore(from: trashedURL, to: record.destinationFileURL)) != nil else { continue }
+            restoredIdsBuilder.insert(representationId)
+        }
+        let restoredRepresentationIds = restoredIdsBuilder
+        _ = try? await database.write { db in
+            for record in batch.records {
+                guard let representationId = record.representation.id, restoredRepresentationIds.contains(representationId) else { continue }
+                if let photo = batch.deletedPhotos[record.representation.photoId] {
+                    try PhotoRepository.restorePhoto(photo, in: db)
+                }
+                try PhotoRepository.restoreRepresentation(record.representation, in: db)
+            }
+        }
+        batch.deletedPhotos.removeAll()
+        scheduleSnapshotSoon()
+        let queue = derivationQueue
+        Task.detached(priority: .utility) {
+            await queue.processLocalBacklog(photoRoots: [targetLibraryId: protonFolderURL])
+        }
     }
 
     // MARK: Export
@@ -486,6 +812,29 @@ public final class AppEnvironment {
             plan, category: category, exportFolderURL: exportFolderURL, libraryRootURL: { roots[$0] }
         )
         scheduleSnapshotSoon()
+
+        let records = results.compactMap(\.undoInfo)
+        if !records.isEmpty {
+            // Threads where each undo trashed a file to a later redo — undoing
+            // again after a redo works by simply calling `undoExport` on the SAME
+            // original `records` a second time (a fresh trash each time), so only
+            // this one box, not a growing chain, is ever needed.
+            let trashedURLsBox = ExportTrashedURLsBox()
+            registerUndo(
+                name: "Export Album",
+                undo: { env in
+                    let (_, trashedURLs) = await env.exportService.undoExport(records, category: category, exportFolderURL: exportFolderURL)
+                    trashedURLsBox.trashedURLs = trashedURLs
+                    env.scheduleSnapshotSoon()
+                },
+                redo: { env in
+                    _ = await env.exportService.redoExport(
+                        records, trashedURLs: trashedURLsBox.trashedURLs, category: category, exportFolderURL: exportFolderURL
+                    )
+                    env.scheduleSnapshotSoon()
+                }
+            )
+        }
         return results
     }
 
@@ -513,4 +862,72 @@ public final class AppEnvironment {
         }
         accessStartedURLs.removeAll()
     }
+
+    // MARK: Reset
+
+    /// Wipes every photo library, album, and export record PhotoCurator knows about
+    /// and takes the app back to first-run state — never touches any file on disk
+    /// (original library files or already-exported files are outside the database
+    /// entirely, see `AppReset`). Never itself undoable, and clears any pending undo
+    /// history, since almost everything on the stack references rows or trashed
+    /// files this wipe makes meaningless to reverse. The caller is expected to call
+    /// `bootstrap()` again immediately after, which — since `hasStartedBootstrap` is
+    /// reset here — re-runs the normal first-launch sequence and naturally lands on
+    /// `.awaitingFolderAccess`, exactly like a fresh install.
+    public func resetApp() async {
+        undoManager.removeAllActions()
+        refreshUndoRedoState()
+
+        photosObservationTask?.cancel()
+        albumsObservationTask?.cancel()
+        unassignedObservationTask?.cancel()
+        snapshotDebounceTask?.cancel()
+
+        try? await AppReset.resetDatabase(database)
+        if let thumbnailCacheDirectory = try? AppPaths.thumbnailCacheDirectory() {
+            try? AppReset.resetThumbnailCache(directory: thumbnailCacheDirectory)
+        }
+
+        for url in accessStartedURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
+        accessStartedURLs.removeAll()
+
+        folderAccess = FolderAccessStatus(photoLibraries: [], exportTarget: nil)
+        gridEntries = []
+        albums = []
+        unassignedGridEntries = []
+        isSyncingInBackground = false
+        hasStartedBootstrap = false
+        launchPhase = .notStarted
+    }
+}
+
+/// Threads a value between a ping-ponging undo/redo pair registered via
+/// `AppEnvironment.registerUndo`, when redo needs whatever undo most recently
+/// produced rather than a value fixed at registration time. `@unchecked Sendable` is
+/// justified here: every access happens on `AppEnvironment`'s `@MainActor`, serialized
+/// through `runSerializedUndoRedo`, so it's never touched concurrently.
+private final class LibrarySnapshotBox: @unchecked Sendable {
+    var snapshot: PhotoLibrarySnapshot?
+}
+
+/// Mutable state shared between an import's undo/redo pair — `undoImportBatch` fills
+/// in `trashedURLs`/`deletedPhotos` as it works, and `redoImportBatch` reads them back.
+/// Same `@unchecked Sendable` justification as `LibrarySnapshotBox`: MainActor-only,
+/// serialized through `runSerializedUndoRedo`.
+private final class ImportUndoBatch: @unchecked Sendable {
+    let records: [ImportUndoRecord]
+    var trashedURLs: [Int64: URL] = [:]
+    var deletedPhotos: [Int64: Photo] = [:]
+
+    init(records: [ImportUndoRecord]) {
+        self.records = records
+    }
+}
+
+/// Threads the trash locations `ExportService.undoExport` produces into a later
+/// `redoExport` call. Same `@unchecked Sendable` justification as the boxes above.
+private final class ExportTrashedURLsBox: @unchecked Sendable {
+    var trashedURLs: [Int: URL] = [:]
 }

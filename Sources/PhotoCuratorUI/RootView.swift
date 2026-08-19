@@ -3,7 +3,7 @@ import AppKit
 import PhotoCuratorCore
 
 enum SidebarSelection: Hashable {
-    /// `id == nil` is "All Libraries".
+    /// `id == nil` is "All Photos".
     case library(id: Int64?)
     case unassigned
     case albumsOverview
@@ -209,7 +209,7 @@ public struct RootView: View {
             .buttonStyle(.plain)
             .help("Import photos from a folder or SD card")
 
-            Label("All Libraries", systemImage: "photo.on.rectangle")
+            Label("All Photos", systemImage: "photo.on.rectangle")
                 .tag(SidebarSelection.library(id: nil))
 
             Label("Unassigned Photos", systemImage: "tray")

@@ -106,7 +106,7 @@ final class ExportServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(results.first?.skippedAsDuplicate, false)
 
         let filesInCategory = try FileManager.default.contentsOfDirectory(atPath: exportRoot.appendingPathComponent("Landscapes").path)
-        XCTAssertEqual(filesInCategory, ["IMG_0001.jpg"])
+        XCTAssertEqual(filesInCategory, ["Landscapes-1.jpg"], "exported files are named by category + album position, not original filename")
 
         // Simulate the `exports` log drifting from what's actually on disk (e.g. a
         // fresh install) — the filesystem check should still recognize the file.
@@ -199,7 +199,7 @@ final class ExportServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(secondPlan.toRemove.map(\.photoId), [photoId])
     }
 
-    func testExportDoesNotSkipDifferentPhotoWithCollidingFilename() async throws {
+    func testExportOverwritesStaleFileAtItsDeterministicSlot() async throws {
         let libraryRoot = try makeTempDirectory()
         let exportRoot = try makeTempDirectory()
         defer {
@@ -207,21 +207,23 @@ final class ExportServiceIntegrationTests: XCTestCase {
             try? FileManager.default.removeItem(at: exportRoot)
         }
 
-        // Pre-populate the destination with an unrelated file that happens to share
-        // the exact filename, but a different size — e.g. a different camera's own
-        // IMG_0001.jpg exported previously.
+        // Pre-populate the destination with unrelated leftover content already
+        // sitting at the deterministic slot this photo's position will compute to
+        // (e.g. cruft from a version predating this naming scheme) — a fresh export
+        // must overwrite it, not skip it or create a second file.
         let categoryDir = exportRoot.appendingPathComponent("Landscapes", isDirectory: true)
         try FileManager.default.createDirectory(at: categoryDir, withIntermediateDirectories: true)
-        try Data("unrelated existing file".utf8).write(to: categoryDir.appendingPathComponent("IMG_0001.jpg"))
+        try Data("stale unrelated content".utf8).write(to: categoryDir.appendingPathComponent("Landscapes-1.jpg"))
 
         let database = try makeDatabase()
         let libraryId = try await database.write { db in
             try PhotoLibraryRepository.create(name: "Test", bookmarkData: Data(), now: 1, in: db).id!
         }
+        let contents = Data("this camera's IMG_0001.jpg".utf8)
         let photoId = try await makePhoto(
             libraryId: libraryId, basename: "IMG_0001",
             jpgURL: libraryRoot.appendingPathComponent("IMG_0001.jpg"),
-            contents: Data("different camera's IMG_0001.jpg".utf8), database: database
+            contents: contents, database: database
         )
         let albumId = try await database.write { db in
             let album = try AlbumRepository.createAlbum(name: "Landscapes", now: 1, in: db)
@@ -231,13 +233,81 @@ final class ExportServiceIntegrationTests: XCTestCase {
 
         let service = try makeService(database: database)
         let plan = await service.planAlbumExport(albumId: albumId, category: "Landscapes", exportFolderURL: exportRoot)
-        XCTAssertEqual(plan.toExport.map(\.photoId), [photoId], "a different photo with a colliding filename must not be treated as a duplicate")
+        XCTAssertEqual(plan.toExport.map(\.photoId), [photoId], "the stale file's size won't match, so this must be a fresh export, not a skip")
 
         let results = await service.applyAlbumExportPlan(plan, category: "Landscapes", exportFolderURL: exportRoot, libraryRootURL: { _ in libraryRoot })
         XCTAssertEqual(results.first?.success, true)
         XCTAssertEqual(results.first?.skippedAsDuplicate, false)
 
-        let filesInCategory = try FileManager.default.contentsOfDirectory(atPath: categoryDir.path).sorted()
-        XCTAssertEqual(filesInCategory, ["IMG_0001-2.jpg", "IMG_0001.jpg"], "the new photo should land under a disambiguated name, not overwrite or get skipped")
+        let filesInCategory = try FileManager.default.contentsOfDirectory(atPath: categoryDir.path)
+        XCTAssertEqual(filesInCategory, ["Landscapes-1.jpg"], "the stale file must be overwritten in place, not duplicated under a disambiguated name")
+        let writtenContents = try Data(contentsOf: categoryDir.appendingPathComponent("Landscapes-1.jpg"))
+        XCTAssertEqual(writtenContents, contents)
+    }
+
+    func testReorderingAlbumRenamesAlreadyExportedFilesRatherThanDuplicating() async throws {
+        let libraryRoot = try makeTempDirectory()
+        let exportRoot = try makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: libraryRoot)
+            try? FileManager.default.removeItem(at: exportRoot)
+        }
+
+        let database = try makeDatabase()
+        let libraryId = try await database.write { db in
+            try PhotoLibraryRepository.create(name: "Test", bookmarkData: Data(), now: 1, in: db).id!
+        }
+        let firstPhotoId = try await makePhoto(
+            libraryId: libraryId, basename: "IMG_0001",
+            jpgURL: libraryRoot.appendingPathComponent("IMG_0001.jpg"),
+            contents: Data("first photo".utf8), database: database
+        )
+        let secondPhotoId = try await makePhoto(
+            libraryId: libraryId, basename: "IMG_0002",
+            jpgURL: libraryRoot.appendingPathComponent("IMG_0002.jpg"),
+            contents: Data("second photo".utf8), database: database
+        )
+        let albumId = try await database.write { db in
+            let album = try AlbumRepository.createAlbum(name: "Landscapes", now: 1, in: db)
+            try AlbumRepository.addPhoto(photoId: firstPhotoId, albumId: album.id!, now: 1, in: db)
+            try AlbumRepository.addPhoto(photoId: secondPhotoId, albumId: album.id!, now: 2, in: db)
+            return album.id!
+        }
+
+        let service = try makeService(database: database)
+        let firstPlan = await service.planAlbumExport(albumId: albumId, category: "Landscapes", exportFolderURL: exportRoot)
+        _ = await service.applyAlbumExportPlan(firstPlan, category: "Landscapes", exportFolderURL: exportRoot, libraryRootURL: { _ in libraryRoot })
+
+        let categoryDir = exportRoot.appendingPathComponent("Landscapes", isDirectory: true)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: categoryDir.path).sorted(),
+            ["Landscapes-1.jpg", "Landscapes-2.jpg"]
+        )
+
+        // Flip the order: second photo now comes first.
+        try await database.write { db in
+            try AlbumRepository.reorderPhotos(albumId: albumId, orderedPhotoIds: [secondPhotoId, firstPhotoId], in: db)
+        }
+
+        let secondPlan = await service.planAlbumExport(albumId: albumId, category: "Landscapes", exportFolderURL: exportRoot)
+        XCTAssertTrue(secondPlan.toExport.isEmpty, "content didn't change, only order — this should be a rename, not a re-export")
+        XCTAssertEqual(secondPlan.toRename.map(\.photoId).sorted(), [firstPhotoId, secondPhotoId].sorted())
+
+        let renameResults = await service.applyAlbumExportPlan(secondPlan, category: "Landscapes", exportFolderURL: exportRoot, libraryRootURL: { _ in libraryRoot })
+        XCTAssertTrue(renameResults.allSatisfy { $0.success && $0.wasRenamed })
+
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: categoryDir.path).sorted(),
+            ["Landscapes-1.jpg", "Landscapes-2.jpg"], "still exactly two files, not four — renamed in place"
+        )
+        XCTAssertEqual(try Data(contentsOf: categoryDir.appendingPathComponent("Landscapes-1.jpg")), Data("second photo".utf8))
+        XCTAssertEqual(try Data(contentsOf: categoryDir.appendingPathComponent("Landscapes-2.jpg")), Data("first photo".utf8))
+
+        // A third plan against the now-stable order should find everything already
+        // in place.
+        let thirdPlan = await service.planAlbumExport(albumId: albumId, category: "Landscapes", exportFolderURL: exportRoot)
+        XCTAssertTrue(thirdPlan.toExport.isEmpty)
+        XCTAssertTrue(thirdPlan.toRename.isEmpty)
+        XCTAssertEqual(thirdPlan.toSkip.map(\.photoId).sorted(), [firstPhotoId, secondPhotoId].sorted())
     }
 }

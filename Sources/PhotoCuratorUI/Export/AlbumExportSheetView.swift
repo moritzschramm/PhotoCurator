@@ -45,7 +45,7 @@ struct AlbumExportSheetView: View {
         } else if isApplying {
             centered { ProgressView("Exporting…") }
         } else if let plan {
-            if plan.toExport.isEmpty && plan.toRemove.isEmpty {
+            if plan.toExport.isEmpty && plan.toRename.isEmpty && plan.toRemove.isEmpty {
                 centered { Text("Already up to date — nothing to export or remove.").foregroundStyle(.secondary) }
             } else {
                 planList(plan)
@@ -65,6 +65,14 @@ struct AlbumExportSheetView: View {
                 Section("Will export (\(plan.toExport.count))") {
                     ForEach(plan.toExport, id: \.photoId) { item in
                         Label(item.filename, systemImage: "arrow.up.circle")
+                    }
+                }
+            }
+            if !plan.toRename.isEmpty {
+                Section("Will rename (\(plan.toRename.count))") {
+                    ForEach(plan.toRename, id: \.photoId) { item in
+                        Label("\(item.oldFilename) → \(item.newFilename)", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundStyle(.orange)
                     }
                 }
             }
@@ -88,12 +96,16 @@ struct AlbumExportSheetView: View {
     }
 
     private func resultsSummary(_ results: [ExportItemResult]) -> some View {
-        let exported = results.filter { $0.success && !$0.skippedAsDuplicate && !$0.wasRemoved }.count
+        let exported = results.filter { $0.success && !$0.skippedAsDuplicate && !$0.wasRemoved && !$0.wasRenamed }.count
+        let renamed = results.filter { $0.success && $0.wasRenamed }.count
         let removed = results.filter { $0.success && $0.wasRemoved }.count
         let failed = results.filter { !$0.success }
         return List {
             Section {
                 Label("\(exported) exported", systemImage: "checkmark.circle")
+                if renamed > 0 {
+                    Label("\(renamed) renamed", systemImage: "arrow.triangle.2.circlepath")
+                }
                 if removed > 0 {
                     Label("\(removed) removed", systemImage: "trash")
                 }
@@ -130,7 +142,7 @@ struct AlbumExportSheetView: View {
 
     private var hasChanges: Bool {
         guard let plan else { return false }
-        return !plan.toExport.isEmpty || !plan.toRemove.isEmpty
+        return !plan.toExport.isEmpty || !plan.toRename.isEmpty || !plan.toRemove.isEmpty
     }
 
     private func loadPlan() async {

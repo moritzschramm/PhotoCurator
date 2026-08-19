@@ -27,16 +27,22 @@ final class AlbumSummariesStore {
 /// with a cover thumbnail and count; tapping one opens the browse view (a
 /// `PhotoGridScreen` scoped to that album).
 ///
-/// A `List` of rows, not a `LazyVGrid` of cards: the grid version consistently
+/// A `LazyVGrid` of cards, with each column's width computed explicitly from the
+/// available width (`GeometryReader` + `.fixed(itemWidth)`) rather than
+/// `GridItem(.adaptive(...))` — an earlier attempt using `.adaptive` consistently
 /// rendered oversized and positionally offset in this NavigationSplitView detail
-/// column (a `LazyVGrid` + `.adaptive` + `aspectRatio` sizing quirk that several
-/// explicit `.frame`/`GeometryReader` attempts didn't resolve). `List` is already
-/// proven correct in this exact split view — it's what the sidebar itself is built
-/// from — so reusing it sidesteps the ambiguity entirely instead of chasing it further.
+/// column, and explicit `.frame`/`GeometryReader` sizing on top of `.adaptive`
+/// columns didn't resolve it. Fixed, explicitly-computed column widths sidestep
+/// whatever `.adaptive` was doing wrong instead of fighting it further.
 struct AlbumsOverviewView: View {
     @Environment(AppEnvironment.self) private var environment
     @State private var store = AlbumSummariesStore()
     let onSelectAlbum: (Int64) -> Void
+
+    private let minCardWidth: CGFloat = 180
+    private let maxCardWidth: CGFloat = 260
+    private let gridSpacing: CGFloat = 20
+    private let gridPadding: CGFloat = 20
 
     var body: some View {
         Group {
@@ -47,13 +53,28 @@ struct AlbumsOverviewView: View {
                     description: Text("Create an album from the Library grid to see it here.")
                 )
             } else {
-                List(store.summaries) { summary in
-                    Button {
-                        onSelectAlbum(summary.album.id ?? -1)
-                    } label: {
-                        AlbumRow(summary: summary)
+                GeometryReader { geometry in
+                    let availableWidth = geometry.size.width - gridPadding * 2
+                    let columnCount = max(1, Int((availableWidth + gridSpacing) / (minCardWidth + gridSpacing)))
+                    let itemWidth = min(
+                        maxCardWidth,
+                        (availableWidth - gridSpacing * CGFloat(columnCount - 1)) / CGFloat(columnCount)
+                    )
+                    let columns = Array(repeating: GridItem(.fixed(itemWidth), spacing: gridSpacing), count: columnCount)
+
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: gridSpacing) {
+                            ForEach(store.summaries) { summary in
+                                Button {
+                                    onSelectAlbum(summary.album.id ?? -1)
+                                } label: {
+                                    AlbumCard(summary: summary, width: itemWidth)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(gridPadding)
                     }
-                    .buttonStyle(.plain)
                 }
             }
         }
@@ -64,37 +85,39 @@ struct AlbumsOverviewView: View {
     }
 }
 
-private struct AlbumRow: View {
+private struct AlbumCard: View {
     let summary: AlbumSummary
+    let width: CGFloat
 
     var body: some View {
-        HStack(spacing: 20) {
+        VStack(alignment: .leading, spacing: 8) {
             ZStack {
-                RoundedRectangle(cornerRadius: 6)
+                RoundedRectangle(cornerRadius: 8)
                     .fill(.quaternary)
                 if let path = summary.coverThumbnailPath, let image = NSImage(contentsOfFile: path) {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .frame(width: width, height: width)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                 } else {
                     Image(systemName: "square.stack")
+                        .font(.system(size: 32))
                         .foregroundStyle(.secondary)
                 }
             }
-            .frame(width: 56, height: 56)
+            .frame(width: width, height: width)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(summary.album.name)
                     .font(.headline)
+                    .lineLimit(1)
                 Text("^[\(summary.photoCount) photo](inflect: true)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            Spacer()
         }
-        .padding(.vertical, 4)
+        .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
     }
 }

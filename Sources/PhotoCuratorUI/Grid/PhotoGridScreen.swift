@@ -66,7 +66,7 @@ struct PhotoGridScreen: View {
     private var title: String {
         switch scope {
         case .library(let id):
-            guard let id else { return "All Libraries" }
+            guard let id else { return "All Photos" }
             return environment.folderAccess.photoLibraries.first { $0.id == id }?.name ?? "Library"
         case .unassigned: return "Unassigned Photos"
         case .album(let id): return environment.albums.first { $0.id == id }?.name ?? "Album"
@@ -87,35 +87,49 @@ struct PhotoGridScreen: View {
         !selection.isEmpty && selection.allSatisfy { selectionAlbumIds[$0]?.contains(albumId) ?? false }
     }
 
+    /// Whether every currently-selected photo is already in `state` — used to decide
+    /// whether clicking that state's toolbar button should apply it, or (clicking an
+    /// already-fully-applied state again) toggle the selection back to unreviewed.
+    private func isSelectionFullyInState(_ state: LifecycleState) -> Bool {
+        !selection.isEmpty && selection.allSatisfy { id in
+            entries.first { $0.id == id }?.photo.photo.lifecycleState == state
+        }
+    }
+
+    private func toggleLifecycle(_ state: LifecycleState) {
+        let targetState: LifecycleState = isSelectionFullyInState(state) ? .new : state
+        Task { await environment.setLifecycle(photoIds: Array(selection), state: targetState) }
+    }
+
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup {
             Button {
-                Task { await environment.setLifecycle(photoIds: Array(selection), state: .candidate) }
+                toggleLifecycle(.candidate)
             } label: {
                 Label("Candidate", systemImage: "star")
             }
             .keyboardShortcut("c", modifiers: [])
             .disabled(selection.isEmpty)
-            .help("Mark as candidate (C)")
+            .help("Mark as candidate — click again to mark unreviewed (C)")
 
             Button {
-                Task { await environment.setLifecycle(photoIds: Array(selection), state: .rejected) }
+                toggleLifecycle(.rejected)
             } label: {
                 Label("Reject", systemImage: "xmark.circle")
             }
             .keyboardShortcut("x", modifiers: [])
             .disabled(selection.isEmpty)
-            .help("Reject (X)")
+            .help("Reject — click again to mark unreviewed (X)")
 
             Button {
-                Task { await environment.setLifecycle(photoIds: Array(selection), state: .accepted) }
+                toggleLifecycle(.accepted)
             } label: {
                 Label("Accept", systemImage: "checkmark")
             }
             .keyboardShortcut("u", modifiers: [])
             .disabled(selection.isEmpty)
-            .help("Mark as accepted (U)")
+            .help("Mark as accepted — click again to mark unreviewed (U)")
 
             Menu {
                 ForEach(environment.albums) { album in
@@ -128,6 +142,11 @@ struct PhotoGridScreen: View {
                                 await environment.toggleAlbumMembershipForSelection(
                                     photoIds: Array(selection), albumId: albumId, allAreMembers: allMembers
                                 )
+                                // The menu can be reopened without the selection ever
+                                // changing (the usual `.task(id: selection)` refresh
+                                // trigger), so the checkmark needs an explicit refresh
+                                // here too, not just on selection change.
+                                selectionAlbumIds = await environment.albumIds(forPhotoIds: Array(selection))
                             }
                         }
                     )) {
@@ -160,6 +179,7 @@ struct PhotoGridScreen: View {
                 Image(systemName: "photo.fill")
                     .font(.body)
             }
+            .padding(.horizontal, 8)
             .help("Thumbnail size — pinch on the grid also zooms")
         }
     }

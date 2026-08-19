@@ -145,6 +145,13 @@ struct CloseUpView: View {
         currentPhotoId = orderedIds[newIndex]
     }
 
+    /// Clicking the button for the state the photo is already in resets it to
+    /// unreviewed, rather than redundantly reapplying the same state.
+    private func toggleLifecycle(_ state: LifecycleState) {
+        let targetState: LifecycleState = pwr?.photo.lifecycleState == state ? .new : state
+        Task { await environment.setLifecycle(photoIds: [currentPhotoId], state: targetState) }
+    }
+
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         // A real Button bound via `.keyboardShortcut`, not `.onKeyPress` — button
@@ -195,25 +202,28 @@ struct CloseUpView: View {
             Divider()
 
             Button {
-                Task { await environment.setLifecycle(photoIds: [currentPhotoId], state: .candidate) }
+                toggleLifecycle(.candidate)
             } label: {
                 Label("Candidate", systemImage: "star")
             }
             .keyboardShortcut("c", modifiers: [])
+            .help("Mark as candidate — click again to mark unreviewed (C)")
 
             Button {
-                Task { await environment.setLifecycle(photoIds: [currentPhotoId], state: .rejected) }
+                toggleLifecycle(.rejected)
             } label: {
                 Label("Reject", systemImage: "xmark.circle")
             }
             .keyboardShortcut("x", modifiers: [])
+            .help("Reject — click again to mark unreviewed (X)")
 
             Button {
-                Task { await environment.setLifecycle(photoIds: [currentPhotoId], state: .accepted) }
+                toggleLifecycle(.accepted)
             } label: {
                 Label("Accept", systemImage: "checkmark")
             }
             .keyboardShortcut("u", modifiers: [])
+            .help("Mark as accepted — click again to mark unreviewed (U)")
 
             Menu {
                 ForEach(environment.albums) { album in

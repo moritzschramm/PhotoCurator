@@ -28,6 +28,36 @@ public struct ImportFileOutcome: Sendable {
     public var success: Bool
     public var skippedAsDuplicate: Bool
     public var errorDescription: String?
+    /// Populated only when `success && !skippedAsDuplicate` — the file and row this
+    /// import actually created, for undo to reverse.
+    public var undoInfo: ImportUndoRecord?
+
+    public init(sourceURL: URL, success: Bool, skippedAsDuplicate: Bool, errorDescription: String?, undoInfo: ImportUndoRecord? = nil) {
+        self.sourceURL = sourceURL
+        self.success = success
+        self.skippedAsDuplicate = skippedAsDuplicate
+        self.errorDescription = errorDescription
+        self.undoInfo = undoInfo
+    }
+}
+
+/// What a single successful, non-duplicate import created — enough for undo to
+/// trash the file and remove the row(s), and for redo to bring both back.
+///
+/// Deliberately doesn't record whether *this call* created the shared `photos` row
+/// (a RAW+JPG pair can share one) — whether a photo row needs deleting is instead
+/// resolved dynamically at undo time via `PhotoRepository.deletePhotoIfEmpty`'s own
+/// remaining-representations check, since with a same-batch sibling, either side's
+/// undo could end up being the one that actually empties it, not necessarily
+/// whichever side created it.
+public struct ImportUndoRecord: Sendable {
+    public var representation: Representation
+    public var destinationFileURL: URL
+
+    public init(representation: Representation, destinationFileURL: URL) {
+        self.representation = representation
+        self.destinationFileURL = destinationFileURL
+    }
 }
 
 enum ImportFileError: Error, LocalizedError {
@@ -260,6 +290,10 @@ public actor ImportPipeline {
                 return repId
             }
 
+            let insertedRepresentation = try await database.read { db in
+                try Representation.fetchOne(db, key: representationId)
+            }
+
             _ = try? await derivationService.derive(
                 representationId: representationId,
                 fileURL: finalURL,
@@ -267,7 +301,10 @@ public actor ImportPipeline {
                 knownContentHash: sourceHash
             )
 
-            return ImportFileOutcome(sourceURL: file.sourceURL, success: true, skippedAsDuplicate: false, errorDescription: nil)
+            let undoInfo = insertedRepresentation.map {
+                ImportUndoRecord(representation: $0, destinationFileURL: finalURL)
+            }
+            return ImportFileOutcome(sourceURL: file.sourceURL, success: true, skippedAsDuplicate: false, errorDescription: nil, undoInfo: undoInfo)
         } catch {
             try? fileManager.removeItem(at: tempURL)
             return ImportFileOutcome(

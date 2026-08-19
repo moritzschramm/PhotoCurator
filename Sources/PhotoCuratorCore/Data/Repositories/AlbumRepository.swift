@@ -83,6 +83,40 @@ public enum AlbumRepository {
         }
     }
 
+    /// An album's photo ids in manual drag-and-drop order, with none of `photos(albumId:in:)`'s
+    /// extra representation joins — used to capture "before" state ahead of a
+    /// reorder, for undo.
+    public static func orderedPhotoIds(albumId: Int64, in db: Database) throws -> [Int64] {
+        try PhotoAlbum
+            .filter(PhotoAlbum.Columns.albumId == albumId)
+            .order(PhotoAlbum.Columns.position.asc)
+            .fetchAll(db)
+            .map(\.photoId)
+    }
+
+    /// An album's raw membership rows (id + position, not joined with photo data) —
+    /// used to snapshot before a delete, for undo.
+    public static func fetchMemberships(albumId: Int64, in db: Database) throws -> [PhotoAlbum] {
+        try PhotoAlbum.filter(PhotoAlbum.Columns.albumId == albumId).fetchAll(db)
+    }
+
+    /// Re-inserts a previously-deleted album at its exact original primary key —
+    /// used by undo, so a redo of anything performed against the original id (e.g.
+    /// adding photos to it) still targets the same album. GRDB inserts at an
+    /// explicit non-nil `id` rather than auto-incrementing.
+    public static func restore(_ album: Album, in db: Database) throws {
+        var album = album
+        try album.insert(db)
+    }
+
+    /// Re-inserts previously-deleted membership rows at their exact original
+    /// values — used by undo alongside `restore(_:in:)`.
+    public static func restore(_ memberships: [PhotoAlbum], in db: Database) throws {
+        for membership in memberships {
+            try membership.insert(db)
+        }
+    }
+
     /// Persists a manual drag-and-drop reorder: `orderedPhotoIds` is the
     /// complete, already-final desired order (not a delta), so this just
     /// re-numbers every membership row to match its index in it.

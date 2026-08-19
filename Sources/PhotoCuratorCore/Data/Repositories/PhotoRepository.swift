@@ -199,6 +199,28 @@ public enum PhotoRepository {
         return rep
     }
 
+    /// Plain single-row delete, no empty-photo cascade — used by import undo, which
+    /// separately decides via `deletePhotoIfEmpty` whether the shared photo row also
+    /// needs removing (unlike `deleteRepresentationCascadingEmptyPhoto`, it needs the
+    /// deleted photo row back, not just a fire-and-forget cascade).
+    public static func deleteRepresentation(id: Int64, in db: Database) throws {
+        _ = try Representation.deleteOne(db, key: id)
+    }
+
+    /// Re-inserts a previously-deleted photo row at its exact original primary key —
+    /// used by import undo's redo path, alongside `restoreRepresentation`.
+    public static func restorePhoto(_ photo: Photo, in db: Database) throws {
+        var photo = photo
+        try photo.insert(db)
+    }
+
+    /// Re-inserts a previously-deleted representation row at its exact original
+    /// primary key.
+    public static func restoreRepresentation(_ representation: Representation, in db: Database) throws {
+        var representation = representation
+        try representation.insert(db)
+    }
+
     public static func updateRepresentation(_ representation: Representation, in db: Database) throws {
         try representation.update(db)
     }
@@ -215,15 +237,18 @@ public enum PhotoRepository {
 
     /// Deletes a photo if it has zero remaining representations — used after a
     /// representation is reassigned to a different photo during a move/rename so the
-    /// old, now-empty grouping doesn't linger (spec §5, §7.1).
+    /// old, now-empty grouping doesn't linger (spec §5, §7.1). Returns the deleted
+    /// row (rather than just a `Bool`) so callers that need to undo the deletion —
+    /// import's undo, in particular — have the exact row to reinsert on redo.
     @discardableResult
-    public static func deletePhotoIfEmpty(photoId: Int64, in db: Database) throws -> Bool {
+    public static func deletePhotoIfEmpty(photoId: Int64, in db: Database) throws -> Photo? {
         let remaining = try Representation
             .filter(Representation.Columns.photoId == photoId)
             .fetchCount(db)
-        guard remaining == 0 else { return false }
+        guard remaining == 0 else { return nil }
+        guard let photo = try Photo.fetchOne(db, key: photoId) else { return nil }
         _ = try Photo.deleteOne(db, key: photoId)
-        return true
+        return photo
     }
 
     /// One-time-per-photo backfill: fills `capture_date` from the earliest known
@@ -279,6 +304,16 @@ public enum PhotoRepository {
 
     public static func saveThumbnail(_ thumbnail: ThumbnailRecord, in db: Database) throws {
         try thumbnail.save(db)
+    }
+
+    /// Each photo's current lifecycle state — used to capture "before" state ahead of
+    /// a `setLifecycleState` call, so it can be undone back to each photo's own prior
+    /// state rather than one shared value (a multi-select undo can start from a mix).
+    public static func fetchLifecycleStates(photoIds: [Int64], in db: Database) throws -> [Int64: LifecycleState] {
+        let photos = try Photo.filter(photoIds.contains(Photo.Columns.id)).fetchAll(db)
+        return Dictionary(uniqueKeysWithValues: photos.compactMap { photo in
+            photo.id.map { ($0, photo.lifecycleState) }
+        })
     }
 
     public static func setLifecycleState(photoId: Int64, state: LifecycleState, now: Int64, in db: Database) throws {

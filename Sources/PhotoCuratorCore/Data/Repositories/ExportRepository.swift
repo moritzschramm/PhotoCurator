@@ -46,11 +46,17 @@ public enum ExportRepository {
 
     /// Deletes both the log row and its destination file — `deleteExport(id:)` above
     /// only ever removed the row, which was fine while nothing needed the file gone
-    /// too. Tolerant of the file already being missing (e.g. removed externally).
-    public static func deleteExportAndFile(id: Int64, exportFolderURL: URL, in db: Database) throws {
-        guard let record = try ExportRecord.fetchOne(db, key: id) else { return }
+    /// too. The file goes to the Trash rather than being permanently removed, both as
+    /// a general safety net and so undo can restore it; returns the deleted record
+    /// and where the file landed (`nil` if it was already missing) so a caller can
+    /// build an undo record from them. Tolerant of the file already being missing
+    /// (e.g. removed externally).
+    @discardableResult
+    public static func deleteExportAndFile(id: Int64, exportFolderURL: URL, in db: Database) throws -> (record: ExportRecord, trashedFileURL: URL?)? {
+        guard let record = try ExportRecord.fetchOne(db, key: id) else { return nil }
         let fileURL = exportFolderURL.appendingPathComponent(record.destinationPath)
-        try? FileManager.default.removeItem(at: fileURL)
+        let trashedFileURL = try? TrashDisposal.moveToTrash(fileURL)
         _ = try ExportRecord.deleteOne(db, key: id)
+        return (record, trashedFileURL)
     }
 }
