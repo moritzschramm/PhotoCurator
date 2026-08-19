@@ -47,6 +47,14 @@ struct PhotoGridScreen: View {
             }
         )
         .navigationTitle(title)
+        // Switching between two libraries (or two albums) keeps this view's
+        // identity — SwiftUI only branches on the *case* of the sidebar's `switch`,
+        // not its associated id — so `@State` survives, and without this the
+        // previous scope's selection stays live: the lifecycle/album toolbar
+        // buttons read as enabled and act on photos that aren't even on screen,
+        // while the grid itself shows nothing selected (those ids aren't in its
+        // current entry list).
+        .onChange(of: scope) { selection = [] }
         .task(id: scope) {
             if case .album(let albumId) = scope {
                 albumStore.start(albumId: albumId, database: environment.database)

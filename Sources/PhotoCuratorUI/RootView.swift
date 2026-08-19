@@ -44,6 +44,7 @@ public struct RootView: View {
     @State private var newAlbumName = ""
     @State private var renamingAlbum: Album?
     @State private var renameAlbumName = ""
+    @State private var deletingAlbum: Album?
     @State private var renamingLibrary: PhotoLibraryFolder?
     @State private var renameLibraryName = ""
     @State private var removingLibrary: PhotoLibraryFolder?
@@ -121,6 +122,22 @@ public struct RootView: View {
                 renamingAlbum = nil
                 Task { await environment.renameAlbum(id: id, name: name) }
             }
+        }
+        .alert(
+            "Delete Album",
+            isPresented: Binding(
+                get: { deletingAlbum != nil },
+                set: { isPresented in if !isPresented { deletingAlbum = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) { deletingAlbum = nil }
+            Button("Delete", role: .destructive) {
+                guard let id = deletingAlbum?.id else { return }
+                deletingAlbum = nil
+                Task { await environment.deleteAlbum(id: id) }
+            }
+        } message: {
+            Text("This deletes the album \"\(deletingAlbum?.name ?? "")\" and its ordering. The photos themselves stay in your library, and their review state is unaffected. You can undo this with ⌘Z.")
         }
         .alert(
             "Rename Library",
@@ -260,8 +277,8 @@ public struct RootView: View {
                                 renameAlbumName = album.name
                                 renamingAlbum = album
                             }
-                            Button("Delete Album", role: .destructive) {
-                                Task { await environment.deleteAlbum(id: album.id ?? -1) }
+                            Button("Delete Album…", role: .destructive) {
+                                deletingAlbum = album
                             }
                         }
                 }

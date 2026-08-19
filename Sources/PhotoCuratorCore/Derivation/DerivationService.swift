@@ -30,8 +30,21 @@ public final class DerivationService: @unchecked Sendable {
         )
         let exif = try? ExifExtractor.extract(from: fileURL)
 
-        try await database.write { db in
+        let supersededCachePaths = try await database.write { db -> [String] in
             let now = Int64(Date().timeIntervalSince1970)
+
+            // `ThumbnailGenerator` writes to a fresh UUID filename every time, and
+            // `saveThumbnail` upserts on (representation_id, size_class) — so
+            // re-deriving a representation silently strands whatever file the row
+            // used to point at. Collected here, deleted after the write commits.
+            var superseded: [String] = []
+            for sizeClass in [ThumbnailSizeClass.grid, .preview] {
+                if let existing = try PhotoRepository.fetchThumbnail(
+                    representationId: representationId, sizeClass: sizeClass, in: db
+                ) {
+                    superseded.append(existing.cachePath)
+                }
+            }
 
             try PhotoRepository.markDerived(representationId: representationId, contentHash: hash, in: db)
 
@@ -71,6 +84,18 @@ public final class DerivationService: @unchecked Sendable {
                     )
                 }
             }
+
+            return superseded
+        }
+
+        // Only after the write commits: a rolled-back transaction would leave the
+        // old rows in place, and they must not be left pointing at deleted files.
+        // Deliberately not extended to rows that *cascade* away (a representation
+        // deleted by reconciliation or by removing a library) — undo of a library
+        // removal restores those rows verbatim and relies on their cached files
+        // still being there (see `PhotoLibraryRepository.snapshot`).
+        for path in supersededCachePaths where path != gridURL.path && path != previewURL.path {
+            try? FileManager.default.removeItem(atPath: path)
         }
 
         return hash

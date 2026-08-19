@@ -32,9 +32,10 @@ public final class AppEnvironment {
     public let importPipeline: ImportPipeline
     public let exportService: ExportService
 
+    /// Read directly by the Edit menu's Undo/Redo commands, which consult
+    /// `canUndo`/`canRedo` on it live at click time rather than through any mirrored
+    /// `@Observable` state here — see `PhotoCuratorApp`'s `.commands` for why.
     public let undoManager = UndoManager()
-    public private(set) var canUndo = false
-    public private(set) var canRedo = false
 
     public var launchPhase: LaunchPhase = .notStarted
     public var folderAccess = FolderAccessStatus(photoLibraries: [], exportTarget: nil)
@@ -81,6 +82,10 @@ public final class AppEnvironment {
     /// quick succession (a fast repeated keypress, a script) must still have both
     /// steps apply in order, not race or silently drop the second one.
     private var undoRedoQueueTail: Task<Void, Never>?
+    /// Same serialize-by-chaining idea as `undoRedoQueueTail`, for background
+    /// reconciles — see `startBackgroundReconcile`.
+    private var backgroundReconcileTail: Task<Void, Never>?
+    private var inFlightBackgroundReconciles = 0
 
     public init() throws {
         let db = try AppDatabase.openDefault()
@@ -103,22 +108,6 @@ public final class AppEnvironment {
         // Foundation defaults to unlimited; a "Remove Library" undo snapshot can hold
         // a large library's full row set in memory for the life of the stack.
         undoManager.levelsOfUndo = 25
-
-        let undoManagerRef = undoManager
-        NotificationCenter.default.addObserver(forName: .NSUndoManagerCheckpoint, object: undoManagerRef, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshUndoRedoState() }
-        }
-        NotificationCenter.default.addObserver(forName: .NSUndoManagerDidUndoChange, object: undoManagerRef, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshUndoRedoState() }
-        }
-        NotificationCenter.default.addObserver(forName: .NSUndoManagerDidRedoChange, object: undoManagerRef, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshUndoRedoState() }
-        }
-    }
-
-    private func refreshUndoRedoState() {
-        canUndo = undoManager.canUndo
-        canRedo = undoManager.canRedo
     }
 
     /// Registers an undo/redo pair for a mutation this method just performed. See
@@ -162,6 +151,15 @@ public final class AppEnvironment {
         // which briefly flashes the failure screen right as the real one finishes.
         guard !hasStartedBootstrap else { return }
         hasStartedBootstrap = true
+
+        // Awaited here, at the top, rather than fired off in the background: the
+        // sweep can only tell a live thumbnail from an orphan by whether a row points
+        // at it, so it has to finish before any derivation starts writing files whose
+        // rows aren't committed yet. It's one directory listing plus one query, so
+        // the cost is negligible next to the reconcile that follows.
+        if let thumbnailCacheDirectory = try? AppPaths.thumbnailCacheDirectory() {
+            await ThumbnailCacheMaintenance.sweepOrphans(directory: thumbnailCacheDirectory, database: database)
+        }
 
         launchPhase = .resolvingFolderAccess
         do {
@@ -437,10 +435,26 @@ public final class AppEnvironment {
     /// `addPhotoLibrary`) still needs to reconcile the (unchanged) export target too.
     private func startBackgroundReconcile(photoLibraries: [LibrarySource], exportFolder: URL? = nil) {
         guard let exportFolder = exportFolder ?? folderAccess.exportTarget?.url else { return }
+        // Queued behind whatever is already reconciling rather than started
+        // immediately: `ReconciliationService` rejects a concurrent call outright
+        // (`ReconciliationError.alreadyRunning`), and that error is swallowed by the
+        // `try?` below — so adding a library while the launch reconcile is still
+        // walking a large library used to leave the new one silently unindexed until
+        // the next launch. Chaining also keeps the paired `processLocalBacklog` from
+        // reading "local but underived" rows out from under a reconcile that hasn't
+        // finished inserting them yet.
+        inFlightBackgroundReconciles += 1
         isSyncingInBackground = true
-        Task { [weak self, reconciliationService, derivationQueue] in
+        let previous = backgroundReconcileTail
+        backgroundReconcileTail = Task { [weak self, reconciliationService, derivationQueue] in
+            _ = await previous?.value
             try? await reconciliationService.reconcile(photoLibraries: photoLibraries, exportFolder: exportFolder)
-            self?.isSyncingInBackground = false
+            if let self {
+                inFlightBackgroundReconciles -= 1
+                // Only the last one still queued clears the indicator — an earlier
+                // link finishing doesn't mean the chain is done.
+                if inFlightBackgroundReconciles == 0 { isSyncingInBackground = false }
+            }
             let roots = Dictionary(uniqueKeysWithValues: photoLibraries.map { ($0.id, $0.url) })
             await derivationQueue.processLocalBacklog(photoRoots: roots)
         }
@@ -876,7 +890,6 @@ public final class AppEnvironment {
     /// `.awaitingFolderAccess`, exactly like a fresh install.
     public func resetApp() async {
         undoManager.removeAllActions()
-        refreshUndoRedoState()
 
         photosObservationTask?.cancel()
         albumsObservationTask?.cancel()

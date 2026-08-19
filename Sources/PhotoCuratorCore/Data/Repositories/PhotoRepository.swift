@@ -114,6 +114,16 @@ public enum PhotoRepository {
             .fetchOne(db)
     }
 
+    /// Same lookup, restricted to one library — for callers that are reasoning about
+    /// a single library's own files (reconciliation's move/rename rescue) and must
+    /// not match a byte-identical file that lives under a *different* registered
+    /// root, since those are two real, separately-tracked files on disk.
+    public static func findRepresentation(contentHash: String, libraryId: Int64, in db: Database) throws -> Representation? {
+        try Representation
+            .filter(Representation.Columns.contentHash == contentHash && Representation.Columns.libraryId == libraryId)
+            .fetchOne(db)
+    }
+
     /// Indexes every representation by relative path, for O(1) lookups while diffing a
     /// large directory enumeration against the database (spec §7.1).
     public static func allRepresentationsByRelativePath(in db: Database) throws -> [String: Representation] {

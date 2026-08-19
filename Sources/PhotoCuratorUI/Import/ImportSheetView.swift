@@ -211,6 +211,10 @@ struct ImportSheetView: View {
             return
         }
         isScanning = true
+        // Cleared per attempt, not just set on failure: `content` renders the error
+        // ahead of the group list, so a stale one from an earlier attempt would keep
+        // the sheet stuck on the error screen even after a later scan succeeded.
+        scanError = nil
         // A fresh scan means a fresh set of groups — stale basenames from a
         // previous scan (e.g. after switching the destination library) shouldn't
         // silently deselect an unrelated group that happens to share a name.

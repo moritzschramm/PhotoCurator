@@ -184,11 +184,17 @@ public actor ReconciliationService {
             computedHash = try? ContentHasher.sha256(ofFileAt: newFile.file.url)
         }
 
-        // Deliberately unscoped by libraryId: a byte-identical file already indexed
-        // under a *different* library is still the same real-world photo, and
-        // shouldn't be re-stored as a second copy just because it's being
-        // encountered again via a different registered root.
-        if let hash = computedHash, let match = try PhotoRepository.findRepresentation(contentHash: hash, in: db) {
+        // Scoped to the library being reconciled. This rescue exists to recognize a
+        // file that moved/was renamed *within* one library; matching across
+        // libraries instead makes two registered roots that each hold a copy of the
+        // same photo fight over the single representation row — each reconcile pass
+        // repoints it at whichever library ran last, and `reassignRepresentation`'s
+        // `deletePhotoIfEmpty` then drops the photo row the other library was using,
+        // cascading away its album membership and resetting its review verdict to
+        // `new`. Two copies under two roots are two real files, and each library
+        // keeps its own row for its own copy.
+        if let hash = computedHash,
+           let match = try PhotoRepository.findRepresentation(contentHash: hash, libraryId: libraryId, in: db) {
             try reassignRepresentation(match, libraryId: libraryId, to: newFile.file, now: now, in: db)
             return match.id
         }
@@ -226,10 +232,9 @@ public actor ReconciliationService {
     /// Repoints an existing representation row at its new location, re-deriving which
     /// Photo it groups under (source dir / basename may have changed), and cleans up
     /// the old Photo if this was its last remaining representation. `libraryId` is the
-    /// library currently being reconciled — a representation being "moved" always
-    /// stays within the same library being scanned; a hash-rescue match found under a
-    /// different library (see `applyNewFile`) is re-pointed to this one instead, which
-    /// is the correct behavior since the file is now physically located here.
+    /// library currently being reconciled — both the path/provisional-key matches and
+    /// the hash rescue in `applyNewFile` are scoped to it, so a representation being
+    /// "moved" always stays within the library it already belonged to.
     private static func reassignRepresentation(
         _ existing: Representation,
         libraryId: Int64,

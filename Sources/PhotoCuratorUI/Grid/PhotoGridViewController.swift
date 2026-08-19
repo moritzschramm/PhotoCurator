@@ -6,6 +6,15 @@ import PhotoCuratorCore
 /// `NSCollectionView`'s own built-in keyboard handling.
 final class ActivatablePhotoCollectionView: NSCollectionView {
     var onActivateSelection: (() -> Void)?
+    /// Assigning `selectionIndexPaths` directly never calls the delegate's
+    /// `didSelectItemsAt`/`didDeselectItemsAt` — which is exactly what lets
+    /// `PhotoGridViewController.syncSelection` push SwiftUI's selection down without
+    /// looping back up. Shift-click below assigns it too, so it has to report the
+    /// change itself or the range would stay purely visual: the SwiftUI binding
+    /// would keep the pre-shift-click value, the toolbar would act on the wrong
+    /// photos, and the next re-render's `syncSelection` would silently revert the
+    /// highlight.
+    var onSelectionChangedProgrammatically: (() -> Void)?
 
     /// The item a plain or cmd-click last landed on, i.e. the fixed end of a
     /// shift-click range. NSCollectionView doesn't implement range selection
@@ -33,6 +42,7 @@ final class ActivatablePhotoCollectionView: NSCollectionView {
             let lo = min(anchor.item, indexPath.item)
             let hi = max(anchor.item, indexPath.item)
             selectionIndexPaths = Set((lo...hi).map { IndexPath(item: $0, section: anchor.section) })
+            onSelectionChangedProgrammatically?()
             return
         }
 
@@ -84,6 +94,9 @@ final class PhotoGridViewController: NSViewController {
         collectionView.delegate = self
         collectionView.onActivateSelection = { [weak self] in
             self?.activateFirstSelection()
+        }
+        collectionView.onSelectionChangedProgrammatically = { [weak self] in
+            self?.reportSelection()
         }
         collectionView.setDraggingSourceOperationMask(.move, forLocal: true)
         collectionView.registerForDraggedTypes([Self.photoDragType])
@@ -217,7 +230,7 @@ extension PhotoGridViewController: NSCollectionViewDelegate {
         reportSelection()
     }
 
-    private func reportSelection() {
+    fileprivate func reportSelection() {
         let ids = collectionView.selectionIndexPaths.compactMap { dataSource.itemIdentifier(for: $0) }
         onSelectionChange?(Set(ids))
     }
