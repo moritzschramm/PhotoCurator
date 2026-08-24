@@ -74,23 +74,37 @@ final class MultiLibraryReconciliationTests: XCTestCase {
     /// A file genuinely moved *within* one library is still recognized by content
     /// hash rather than re-indexed as a new photo — the behaviour the (previously
     /// unscoped) rescue exists for, which scoping it by library must not break.
+    ///
+    /// Runs a real derivation pass between the two reconciles, the way the app does
+    /// after every reconcile: indexing itself no longer hashes files it has no reason
+    /// to hash, so derivation is what puts the content hash on the row that the
+    /// rescue then matches against.
     func testAMoveWithinOneLibraryIsStillRescuedByContentHash() async throws {
         let root = try makeTempDirectory()
         let exportRoot = try makeTempDirectory()
+        let cacheDirectory = try makeTempDirectory()
         defer {
-            for url in [root, exportRoot] { try? FileManager.default.removeItem(at: url) }
+            for url in [root, exportRoot, cacheDirectory] { try? FileManager.default.removeItem(at: url) }
         }
 
         let originalDir = root.appendingPathComponent("CameraA", isDirectory: true)
         try FileManager.default.createDirectory(at: originalDir, withIntermediateDirectories: true)
-        try Data("some photo bytes".utf8).write(to: originalDir.appendingPathComponent("IMG_0001.jpg"))
+        try writeJPEG(to: originalDir.appendingPathComponent("IMG_0001.jpg"), gray: 0.3)
 
         let database = try makeDatabase()
         let library = try await registerLibrary(at: root, database: database, name: "A")
         let service = ReconciliationService(database: database)
         try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
 
+        let derivationQueue = DerivationQueue(
+            database: database,
+            derivationService: DerivationService(database: database, thumbnailCacheDirectory: cacheDirectory)
+        )
+        await derivationQueue.processLocalBacklog(photoRoots: [library.id: root])
+
         let representationId = try await database.read { db in try Representation.fetchAll(db).first!.id! }
+        let hashAfterDerivation = try await database.read { db in try Representation.fetchAll(db).first!.contentHash }
+        XCTAssertNotNil(hashAfterDerivation, "derivation should have recorded a content hash to match against")
 
         // Move and rename it — both the path and the provisional key change, so only
         // the content hash can still tie it to the existing row.

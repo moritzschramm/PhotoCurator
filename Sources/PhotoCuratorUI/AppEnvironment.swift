@@ -450,7 +450,11 @@ public final class AppEnvironment {
             _ = await previous?.value
             try? await reconciliationService.reconcile(photoLibraries: photoLibraries, exportFolder: exportFolder)
             if let self {
-                inFlightBackgroundReconciles -= 1
+                // Floored at zero rather than decremented blindly: `resetApp` zeroes
+                // the counter while a reconcile may still be in flight, and a
+                // decrement past zero would leave the `== 0` check below permanently
+                // false — wedging the spinner on for the rest of the session.
+                inFlightBackgroundReconciles = max(0, inFlightBackgroundReconciles - 1)
                 // Only the last one still queued clears the indicator — an earlier
                 // link finishing doesn't mean the chain is done.
                 if inFlightBackgroundReconciles == 0 { isSyncingInBackground = false }
@@ -794,10 +798,18 @@ public final class AppEnvironment {
         }
         let restoredRepresentationIds = restoredIdsBuilder
         _ = try? await database.write { db in
+            // A RAW+JPG pair shares one photo row, so both records name the same
+            // `photoId` — restoring it twice violates the primary key and throws,
+            // which would roll back every row restore in this transaction while the
+            // files have already been moved back out of the Trash. Each photo row is
+            // therefore restored at most once per batch.
+            var restoredPhotoIds: Set<Int64> = []
             for record in batch.records {
                 guard let representationId = record.representation.id, restoredRepresentationIds.contains(representationId) else { continue }
-                if let photo = batch.deletedPhotos[record.representation.photoId] {
+                let photoId = record.representation.photoId
+                if !restoredPhotoIds.contains(photoId), let photo = batch.deletedPhotos[photoId] {
                     try PhotoRepository.restorePhoto(photo, in: db)
+                    restoredPhotoIds.insert(photoId)
                 }
                 try PhotoRepository.restoreRepresentation(record.representation, in: db)
             }
@@ -895,6 +907,12 @@ public final class AppEnvironment {
         albumsObservationTask?.cancel()
         unassignedObservationTask?.cancel()
         snapshotDebounceTask?.cancel()
+        // Dropped, not just cancelled: a queued reconcile chain re-registers the
+        // wiped libraries' rows, and leaving the tail in place would make the next
+        // chain link await a task belonging to the pre-reset session.
+        backgroundReconcileTail?.cancel()
+        backgroundReconcileTail = nil
+        inFlightBackgroundReconciles = 0
 
         try? await AppReset.resetDatabase(database)
         if let thumbnailCacheDirectory = try? AppPaths.thumbnailCacheDirectory() {

@@ -18,13 +18,33 @@ final class CloseUpImageLoader {
     private(set) var isRenderingRaw = false
     private(set) var rawRenderFailed = false
 
+    /// Long edge, in pixels, a full RAW render is capped at.
+    ///
+    /// `CIRAWFilter` at native resolution decodes ~60 MP on a modern body — seconds of
+    /// CPU and hundreds of megabytes for an image that is then drawn into a window a
+    /// fraction of that size. This is comfortably above any current display's pixel
+    /// width, so "fit to window" is pixel-exact and the 8× zoom degrades gracefully
+    /// rather than costing that on every photo browsed past.
+    ///
+    /// `nonisolated` because the render itself deliberately runs off the main actor
+    /// and needs to read this; it's an immutable `Sendable` constant, so there's no
+    /// actor state to protect.
+    private nonisolated static let maxRawRenderPixelSize: CGFloat = 4096
+
     private var loadTask: Task<Void, Never>?
+    /// The in-flight (or most recent) RAW render. Held separately from `loadTask`
+    /// because the render runs detached — cancelling the parent doesn't reach it —
+    /// and because each new render chains onto this one, so that arrowing through a
+    /// library queues renders one behind another instead of running a decode per
+    /// keypress in parallel.
+    private var rawRenderTask: Task<CGImage?, Never>?
     private var fastImage: NSImage?
     private var upgradedImage: NSImage?
     private var userToggled = false
 
     func load(pwr: PhotoWithRepresentations, photoRoot: URL, database: AppDatabase, derivationQueue: DerivationQueue) {
         loadTask?.cancel()
+        rawRenderTask?.cancel()
         displayImage = nil
         fastImage = nil
         upgradedImage = nil
@@ -103,9 +123,18 @@ final class CloseUpImageLoader {
         // the outside. Per spec §7.4, the render attempt itself is the real
         // arbiter: fall back to the embedded preview only if it actually fails.
         let fileURL = raw.fileURL(photoRoot: photoRoot)
-        let rendered = try? await Task.detached(priority: .userInitiated) {
-            try RawImageRenderer.render(fileURL: fileURL)
-        }.value
+        let previousRender = rawRenderTask
+        let renderTask = Task.detached(priority: .userInitiated) { () -> CGImage? in
+            // Serialized behind whatever was already rendering, and re-checked for
+            // cancellation once it's this one's turn: browsing quickly past a photo
+            // supersedes its render before it ever starts work, rather than piling
+            // full-resolution decodes on top of each other.
+            _ = await previousRender?.value
+            guard !Task.isCancelled else { return nil }
+            return try? RawImageRenderer.render(fileURL: fileURL, maxPixelSize: Self.maxRawRenderPixelSize)
+        }
+        rawRenderTask = renderTask
+        let rendered = await renderTask.value
         guard !Task.isCancelled else { return }
 
         let elapsed = Date().timeIntervalSince(start)

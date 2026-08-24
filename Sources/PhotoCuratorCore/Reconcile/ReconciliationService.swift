@@ -64,10 +64,15 @@ public actor ReconciliationService {
 
         for library in photoLibraries {
             onProgress?(Progress(phase: .enumeratingPhotoLibrary))
-            let photoFiles = try DirectoryEnumerator.enumerateFiles(under: library.url)
+            let enumeration = try DirectoryEnumerator.enumerate(under: library.url)
+            let photoFiles = enumeration.files
 
             onProgress?(Progress(phase: .reconcilingPhotoLibrary, total: photoFiles.count))
-            try await reconcilePhotoLibrary(photoFiles, libraryId: library.id) { processed in
+            try await reconcilePhotoLibrary(
+                photoFiles,
+                libraryId: library.id,
+                enumerationWasComplete: enumeration.isComplete
+            ) { processed in
                 onProgress?(Progress(phase: .reconcilingPhotoLibrary, processed: processed, total: photoFiles.count))
             }
         }
@@ -81,10 +86,12 @@ public actor ReconciliationService {
         }
 
         onProgress?(Progress(phase: .enumeratingExportTarget))
-        let exportFiles = try DirectoryEnumerator.enumerateFiles(under: exportFolder)
+        let exportEnumeration = try DirectoryEnumerator.enumerate(under: exportFolder)
 
-        onProgress?(Progress(phase: .reconcilingExportTarget, total: exportFiles.count))
-        try await reconcileExportTarget(exportFiles)
+        onProgress?(Progress(phase: .reconcilingExportTarget, total: exportEnumeration.files.count))
+        if exportEnumeration.isComplete {
+            try await reconcileExportTarget(exportEnumeration.files)
+        }
 
         onProgress?(Progress(phase: .establishingBaseline))
         try await establishBaselineIfNeeded()
@@ -94,7 +101,23 @@ public actor ReconciliationService {
 
     // MARK: Photo library
 
-    private func reconcilePhotoLibrary(_ files: [EnumeratedFile], libraryId: Int64, onBatch: @Sendable (Int) -> Void) async throws {
+    /// A reconcile pass never deletes rows when more than this fraction of a
+    /// library's known files went missing at once, unless the library is smaller than
+    /// `massDeletionFloor` rows. Wholesale disappearance is far more often a folder
+    /// that didn't mount, or a sync client that hasn't populated it yet, than a user
+    /// deleting most of their photos outside the app — and deletion here cascades the
+    /// review verdict, album membership and export history away with the row. Small
+    /// libraries are exempt so the ordinary "I removed my only photo" case still
+    /// reconciles immediately.
+    private static let massDeletionFloor = 20
+    private static let massDeletionFraction = 0.5
+
+    private func reconcilePhotoLibrary(
+        _ files: [EnumeratedFile],
+        libraryId: Int64,
+        enumerationWasComplete: Bool,
+        onBatch: @Sendable (Int) -> Void
+    ) async throws {
         let existing = try await database.read { db in
             try Representation.filter(Representation.Columns.libraryId == libraryId).fetchAll(db)
         }
@@ -132,15 +155,55 @@ public actor ReconciliationService {
 
         var stillMissing = plan.unmatchedExistingIds
         for batch in plan.newFiles.chunked(into: 100) {
+            // Hashing reads every byte of the file, so it happens out here rather
+            // than inside the write closure below — doing it in there held GRDB's
+            // single writer (and with it every UI observation) for as long as a full
+            // pass over the library's bytes on a first index.
+            //
+            // It is also skipped entirely unless some existing row is currently
+            // unaccounted for: the only thing a hash can accomplish here is rescuing
+            // one of those, so with nothing missing — the common case, and every
+            // first index — there is nothing to look for. Hashes for the rows
+            // themselves arrive from the derivation pass that follows reconciliation.
+            //
+            // Bound as a `let`: the write closure below is `@Sendable` and captures
+            // this by reference, so leaving it mutable would let a later assignment
+            // race the closure — benign as written, but a genuine data race the
+            // moment anything is added between the two, and an error outright in the
+            // Swift 6 language mode.
+            let hashesByPath: [String: String]
+            if stillMissing.isEmpty {
+                hashesByPath = [:]
+            } else {
+                let localFiles = batch.filter(\.file.isLocal)
+                hashesByPath = await BackgroundWork.run {
+                    var hashes: [String: String] = [:]
+                    for newFile in localFiles {
+                        if let hash = try? ContentHasher.sha256(ofFileAt: newFile.file.url) {
+                            hashes[newFile.file.relativePath] = hash
+                        }
+                    }
+                    return hashes
+                }
+            }
+
             // Each new-file write reports back the id of any existing representation
             // it turned out to be a hash-based rescue for; `stillMissing` is only
             // mutated back here in actor-isolated code, never inside the `@Sendable`
             // write closure itself.
+            let rescueCandidates = stillMissing
             let rescuedIds = try await database.write { db -> [Int64] in
                 let now = Int64(Date().timeIntervalSince1970)
                 var rescued: [Int64] = []
                 for newFile in batch {
-                    if let rescuedId = try Self.applyNewFile(newFile, libraryId: libraryId, now: now, in: db) {
+                    if let rescuedId = try Self.applyNewFile(
+                        newFile,
+                        libraryId: libraryId,
+                        contentHash: hashesByPath[newFile.file.relativePath],
+                        rescueCandidates: rescueCandidates,
+                        now: now,
+                        in: db
+                    ) {
                         rescued.append(rescuedId)
                     }
                 }
@@ -152,6 +215,16 @@ public actor ReconciliationService {
             processed += batch.count
             onBatch(processed)
         }
+
+        guard !stillMissing.isEmpty else { return }
+
+        // An incomplete walk can't distinguish "this file is gone" from "this file's
+        // directory wasn't readable this time", and the deletion below is not
+        // recoverable from — it takes the review verdict, album membership and export
+        // history with it. Leave every row alone and let a later, complete pass
+        // decide.
+        guard enumerationWasComplete else { return }
+        guard !Self.isImplausibleMassDeletion(missing: stillMissing.count, known: existing.count) else { return }
 
         // Anything never matched by path, provisional key, or (for local new-file
         // candidates) content hash is gone from disk — the app never deletes or moves
@@ -166,9 +239,15 @@ public actor ReconciliationService {
         }
     }
 
-    /// A file that didn't match by path or provisional key. If it's already local, we
-    /// can freely hash it (no cloud cost) to catch a rename-and-move that changed both
-    /// path and mtime/size bookkeeping (spec §5). Otherwise it's simply new.
+    private static func isImplausibleMassDeletion(missing: Int, known: Int) -> Bool {
+        guard known >= massDeletionFloor else { return false }
+        return Double(missing) / Double(known) > massDeletionFraction
+    }
+
+    /// A file that didn't match by path or provisional key. `contentHash` is its
+    /// already-computed digest when the caller had reason to compute one (see
+    /// `reconcilePhotoLibrary`) — it catches a rename-and-move that changed both path
+    /// and mtime/size bookkeeping (spec §5). Otherwise this is simply a new file.
     /// Returns the id of an existing representation this file turned out to be a
     /// hash-based rescue for, so the caller can strike it off `stillMissing` — or nil
     /// if this really is a brand new representation.
@@ -176,14 +255,11 @@ public actor ReconciliationService {
     private static func applyNewFile(
         _ newFile: ReconciliationPlanner.Plan.NewFile,
         libraryId: Int64,
+        contentHash: String?,
+        rescueCandidates: Set<Int64>,
         now: Int64,
         in db: Database
     ) throws -> Int64? {
-        var computedHash: String?
-        if newFile.file.isLocal {
-            computedHash = try? ContentHasher.sha256(ofFileAt: newFile.file.url)
-        }
-
         // Scoped to the library being reconciled. This rescue exists to recognize a
         // file that moved/was renamed *within* one library; matching across
         // libraries instead makes two registered roots that each hold a copy of the
@@ -193,10 +269,18 @@ public actor ReconciliationService {
         // cascading away its album membership and resetting its review verdict to
         // `new`. Two copies under two roots are two real files, and each library
         // keeps its own row for its own copy.
-        if let hash = computedHash,
-           let match = try PhotoRepository.findRepresentation(contentHash: hash, libraryId: libraryId, in: db) {
+        //
+        // Restricted further to rows this pass could *not* find on disk: a hash that
+        // matches a row whose own file is present just means the library holds two
+        // byte-identical copies, and repointing that row here would make the two
+        // paths trade it back and forth on every reconcile — each pass leaving the
+        // other one unmatched and "rescuing" it straight back.
+        if let contentHash,
+           let match = try PhotoRepository.findRepresentation(contentHash: contentHash, libraryId: libraryId, in: db),
+           let matchId = match.id,
+           rescueCandidates.contains(matchId) {
             try reassignRepresentation(match, libraryId: libraryId, to: newFile.file, now: now, in: db)
-            return match.id
+            return matchId
         }
 
         let photo = try PhotoRepository.upsertPhoto(
@@ -220,7 +304,7 @@ public actor ReconciliationService {
             filename: newFile.file.filename,
             fileSize: newFile.file.fileSize,
             fileMtime: newFile.file.fileMtimeEpoch,
-            contentHash: computedHash,
+            contentHash: contentHash,
             isLocal: newFile.file.isLocal,
             derivationState: .underived,
             indexedAt: now

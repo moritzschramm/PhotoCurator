@@ -7,7 +7,6 @@ import PhotoCuratorCore
 /// visible, never hidden (spec §6, §8).
 final class PhotoGridItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("PhotoGridItem")
-    private static let imageCache = NSCache<NSString, NSImage>()
 
     private let thumbnailImageView = NSImageView()
     private let filenameLabel = NSTextField(labelWithString: "")
@@ -84,13 +83,19 @@ final class PhotoGridItem: NSCollectionViewItem {
 
         if let path = entry.gridThumbnailPath {
             currentThumbnailPath = path
-            if let cached = Self.imageCache.object(forKey: path as NSString) {
+            if let cached = ThumbnailImageCache.cached(path) {
                 thumbnailImageView.image = cached
-            } else if let loaded = NSImage(contentsOfFile: path) {
-                Self.imageCache.setObject(loaded, forKey: path as NSString)
-                thumbnailImageView.image = loaded
             } else {
+                // Reading and decoding the file is off the main thread, so the cell
+                // shows its placeholder background until the image arrives. Cells are
+                // recycled while that's in flight, hence the path check on the way
+                // back in — otherwise a slow load lands in whichever photo's cell
+                // inherited this view.
                 thumbnailImageView.image = nil
+                ThumbnailImageCache.load(path) { [weak self] image in
+                    guard let self, let image, self.currentThumbnailPath == path else { return }
+                    self.thumbnailImageView.image = image
+                }
             }
         } else {
             currentThumbnailPath = nil

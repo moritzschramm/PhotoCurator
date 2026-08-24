@@ -226,6 +226,24 @@ public enum AppMigrations {
             try db.execute(sql: "UPDATE photos SET lifecycle_state = 'reviewed' WHERE lifecycle_state = 'published'")
         }
 
+        // Two lookups that had no index to serve them. `exports` is queried by
+        // (photo_id, category) throughout `ExportService` but was only indexed by
+        // content hash; `photo_albums` is queried by `album_id` alone (album
+        // contents, counts, membership) while its primary key leads with `photo_id`,
+        // which a B-tree can't use for an album-only lookup.
+        migrator.registerMigration("v5_export_and_album_lookup_indexes") { db in
+            try db.create(
+                index: "idx_exports_photo_category",
+                on: "exports",
+                columns: ["photo_id", "category"]
+            )
+            try db.create(
+                index: "idx_photo_albums_album",
+                on: "photo_albums",
+                columns: ["album_id"]
+            )
+        }
+
         return migrator
     }
 }

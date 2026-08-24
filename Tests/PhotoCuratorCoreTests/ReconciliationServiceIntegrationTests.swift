@@ -45,9 +45,11 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(img1?.representations.count, 2, "RAW+JPG siblings must group under one Photo")
         XCTAssertNotNil(img1?.jpg)
         XCTAssertNotNil(img1?.raw)
-        // Local files are hashed opportunistically as part of indexing, so this
-        // should already carry a content hash without a separate derivation pass.
-        XCTAssertNotNil(img1?.jpg?.contentHash)
+        // Indexing deliberately reads no file bytes: the only thing a hash buys at
+        // this stage is rescuing a row whose file went missing, and a first index has
+        // no such rows. Content hashes are filled in by the derivation pass that runs
+        // after reconciliation (see `DerivationQueue.processLocalBacklog`).
+        XCTAssertNil(img1?.jpg?.contentHash)
 
         // First-run baseline (spec §6): everything from the initial index is
         // `reviewed`, not `new`.
@@ -104,6 +106,45 @@ final class ReconciliationServiceIntegrationTests: XCTestCase {
 
         let photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
         XCTAssertTrue(photos.isEmpty, "a photo whose only file disappeared should be removed, not left dangling")
+    }
+
+    /// Deleting a row takes its review verdict, album membership and export history
+    /// with it, and there's no way back. A library that suddenly appears mostly empty
+    /// is far more often a folder that didn't mount (or a sync client that hasn't
+    /// populated it yet) than a user deleting most of their photos behind the app's
+    /// back, so a pass like that is left alone entirely. Ordinary deletions, and
+    /// libraries below the size floor, still reconcile immediately — see
+    /// `testRemovedFileIsDeletedOnNextReconcile`.
+    func testAnImplausibleMassDisappearanceDoesNotDeleteRows() async throws {
+        let photoRoot = try makeTempDirectory()
+        let exportRoot = try makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: photoRoot)
+            try? FileManager.default.removeItem(at: exportRoot)
+        }
+        let cameraDir = photoRoot.appendingPathComponent("CameraA", isDirectory: true)
+        try FileManager.default.createDirectory(at: cameraDir, withIntermediateDirectories: true)
+        let fileURLs = (1...25).map { cameraDir.appendingPathComponent("IMG_\($0).jpg") }
+        for (index, url) in fileURLs.enumerated() {
+            try Data("photo \(index)".utf8).write(to: url)
+        }
+
+        let database = try makeDatabase()
+        let library = try await registerLibrary(at: photoRoot, database: database)
+        let service = ReconciliationService(database: database)
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
+
+        // A plausible deletion — a fifth of the library — is applied as usual.
+        for url in fileURLs.prefix(5) { try FileManager.default.removeItem(at: url) }
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
+        var photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
+        XCTAssertEqual(photos.count, 20, "an ordinary deletion should still be reconciled")
+
+        // Most of what's left vanishing at once is not treated as a deletion.
+        for url in fileURLs.dropFirst(5).prefix(15) { try FileManager.default.removeItem(at: url) }
+        try await service.reconcile(photoLibraries: [library], exportFolder: exportRoot)
+        photos = try await database.read { db in try PhotoRepository.fetchAllPhotosWithRepresentations(db) }
+        XCTAssertEqual(photos.count, 20, "a mass disappearance should be ignored, not applied")
     }
 
     func testMovingAFileToADifferentSubdirectoryReconcilesRatherThanDuplicates() async throws {

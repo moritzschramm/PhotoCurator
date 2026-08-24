@@ -7,11 +7,21 @@ import PhotoCuratorCore
 @Observable
 final class AlbumSummariesStore {
     private(set) var summaries: [AlbumSummary] = []
-    private var task: Task<Void, Never>?
+    private let observationTask = CancellableTaskBox()
+    private var hasStarted = false
+
+    /// Without this the observation outlives the store — it holds only a `weak self`,
+    /// so nothing keeps the store alive, but nothing cancels the task either — and
+    /// GRDB keeps recomputing every album's summary on every database write for the
+    /// rest of the session.
+    deinit {
+        observationTask.cancel()
+    }
 
     func start(database: AppDatabase) {
-        guard task == nil else { return }
-        task = Task { [weak self] in
+        guard !hasStarted else { return }
+        hasStarted = true
+        observationTask.replace(with: Task { [weak self] in
             let observation = ValueObservation.tracking { db in try AlbumRepository.fetchAllAlbumSummaries(in: db) }
             do {
                 for try await value in observation.values(in: database.dbPool) {
@@ -19,7 +29,7 @@ final class AlbumSummariesStore {
                     self?.summaries = value
                 }
             } catch { }
-        }
+        })
     }
 }
 
@@ -89,13 +99,18 @@ private struct AlbumCard: View {
     let summary: AlbumSummary
     let width: CGFloat
 
+    /// Loaded through the shared cache rather than `NSImage(contentsOfFile:)` inline:
+    /// a `body` runs on the main thread and re-runs on every layout pass, so reading
+    /// the file there put a synchronous disk read per card into each one.
+    @State private var coverImage: NSImage?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(.quaternary)
-                if let path = summary.coverThumbnailPath, let image = NSImage(contentsOfFile: path) {
-                    Image(nsImage: image)
+                if let coverImage {
+                    Image(nsImage: coverImage)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: width, height: width)
@@ -107,6 +122,13 @@ private struct AlbumCard: View {
                 }
             }
             .frame(width: width, height: width)
+            .task(id: summary.coverThumbnailPath) {
+                guard let path = summary.coverThumbnailPath else {
+                    coverImage = nil
+                    return
+                }
+                coverImage = await ThumbnailImageCache.load(path)
+            }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(summary.album.name)

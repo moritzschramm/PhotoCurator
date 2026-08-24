@@ -10,22 +10,6 @@ final class DerivationServiceTests: XCTestCase {
         return try AppDatabase(path: dbURL)
     }
 
-    /// A real (tiny) JPEG — `ThumbnailGenerator` goes through ImageIO, so a file of
-    /// arbitrary bytes wouldn't produce a thumbnail at all.
-    private func writeJPEG(to url: URL, gray: CGFloat) throws {
-        let context = CGContext(
-            data: nil, width: 32, height: 32, bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        )!
-        context.setFillColor(CGColor(red: gray, green: gray, blue: gray, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
-        let destination = CGImageDestinationCreateWithURL(
-            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil
-        )!
-        CGImageDestinationAddImage(destination, context.makeImage()!, nil)
-        XCTAssertTrue(CGImageDestinationFinalize(destination))
-    }
-
     /// `ThumbnailGenerator` writes a fresh UUID filename on every run and
     /// `saveThumbnail` upserts on (representation_id, size_class), so re-deriving the
     /// same representation used to strand the previous pair of cached JPEGs on disk

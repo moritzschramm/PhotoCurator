@@ -14,6 +14,15 @@ public final class DerivationService: @unchecked Sendable {
         self.thumbnailCacheDirectory = thumbnailCacheDirectory
     }
 
+    /// Everything derived from the file's bytes in one off-thread pass, before any of
+    /// it touches the database.
+    private struct DerivedArtifacts: Sendable {
+        var hash: String
+        var gridURL: URL
+        var previewURL: URL
+        var exif: ExtractedExif?
+    }
+
     @discardableResult
     public func derive(
         representationId: Int64,
@@ -21,14 +30,30 @@ public final class DerivationService: @unchecked Sendable {
         kind: RepresentationKind,
         knownContentHash: String? = nil
     ) async throws -> String {
-        let hash = try knownContentHash ?? ContentHasher.sha256(ofFileAt: fileURL)
-        let gridURL = try ThumbnailGenerator.generate(
-            from: fileURL, kind: kind, size: .grid, destinationDirectory: thumbnailCacheDirectory
-        )
-        let previewURL = try ThumbnailGenerator.generate(
-            from: fileURL, kind: kind, size: .preview, destinationDirectory: thumbnailCacheDirectory
-        )
-        let exif = try? ExifExtractor.extract(from: fileURL)
+        let cacheDirectory = thumbnailCacheDirectory
+        // Hashing and ImageIO decoding are blocking CPU work with no suspension
+        // points. Left on the cooperative pool, the backlog's four concurrent
+        // derivations tie up most of its threads and stall every unrelated `await` in
+        // the app — including the database observations the UI renders from.
+        let artifacts = try await BackgroundWork.run { () throws -> DerivedArtifacts in
+            let hash = try knownContentHash ?? ContentHasher.sha256(ofFileAt: fileURL)
+            let gridURL = try ThumbnailGenerator.generate(
+                from: fileURL, kind: kind, size: .grid, destinationDirectory: cacheDirectory
+            )
+            let previewURL = try ThumbnailGenerator.generate(
+                from: fileURL, kind: kind, size: .preview, destinationDirectory: cacheDirectory
+            )
+            return DerivedArtifacts(
+                hash: hash,
+                gridURL: gridURL,
+                previewURL: previewURL,
+                exif: try? ExifExtractor.extract(from: fileURL)
+            )
+        }
+        let hash = artifacts.hash
+        let gridURL = artifacts.gridURL
+        let previewURL = artifacts.previewURL
+        let exif = artifacts.exif
 
         let supersededCachePaths = try await database.write { db -> [String] in
             let now = Int64(Date().timeIntervalSince1970)

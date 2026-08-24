@@ -35,10 +35,13 @@ public enum PhotoRepository {
     /// Global across every registered library, matching "All Albums".
     public static func fetchUnassignedGridEntries(_ db: Database) throws -> [PhotoGridEntry] {
         let reviewedStates = [LifecycleState.accepted.rawValue, LifecycleState.candidate.rawValue]
-        let assignedPhotoIds = try Int64.fetchSet(db, sql: "SELECT DISTINCT photo_id FROM photo_albums")
+        // `NOT EXISTS` rather than materializing every assigned photo id into Swift
+        // and sending it back down as a giant `IN (…)` list — SQLite answers this
+        // from `idx_photo_albums_album`'s sibling lookup per row, and the query no
+        // longer grows with the number of album memberships.
         let photos = try Photo
             .filter(reviewedStates.contains(Photo.Columns.lifecycleState))
-            .filter(!assignedPhotoIds.contains(Photo.Columns.id))
+            .filter(sql: "NOT EXISTS (SELECT 1 FROM photo_albums WHERE photo_albums.photo_id = photos.id)")
             .order(Photo.Columns.captureDate.desc, Photo.Columns.basename.asc, Photo.Columns.id.asc)
             .fetchAll(db)
         return try attachGridThumbnails(to: attachRepresentations(to: photos, db), db)
@@ -362,7 +365,17 @@ public enum PhotoRepository {
     // MARK: Helpers
 
     private static func attachRepresentations(to photos: [Photo], _ db: Database) throws -> [PhotoWithRepresentations] {
-        let allReps = try Representation.fetchAll(db)
+        let photoIds = photos.compactMap(\.id)
+        guard !photoIds.isEmpty else {
+            return photos.map { PhotoWithRepresentations(photo: $0, representations: []) }
+        }
+        // Scoped to the photos actually being attached to. Fetching *every*
+        // representation was fine for the unfiltered grid but meant a single-library
+        // or unassigned-photos query still paid for the whole database on every
+        // observation refire.
+        let allReps = try Representation
+            .filter(photoIds.contains(Representation.Columns.photoId))
+            .fetchAll(db)
         let grouped = Dictionary(grouping: allReps, by: { $0.photoId })
         return photos.map { photo in
             PhotoWithRepresentations(

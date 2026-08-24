@@ -28,6 +28,17 @@ public final class AppDatabase: @unchecked Sendable {
         try await dbPool.read(value)
     }
 
+    /// A write that is *not* wrapped in GRDB's implicit transaction. Needed only for
+    /// the handful of statements SQLite refuses to run inside one — `VACUUM INTO`
+    /// (see `SnapshotService`) being the case this exists for. Everything else must
+    /// go through `write`, which keeps its batch atomic.
+    @discardableResult
+    public func writeWithoutTransaction<T: Sendable>(
+        _ updates: @escaping @Sendable (Database) throws -> T
+    ) async throws -> T {
+        try await dbPool.writeWithoutTransaction(updates)
+    }
+
     /// Synchronous write for call sites already off the main thread (e.g. inside the
     /// import or derivation pipelines' own background queues).
     @discardableResult

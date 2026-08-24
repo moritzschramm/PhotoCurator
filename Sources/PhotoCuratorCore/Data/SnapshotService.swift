@@ -50,7 +50,12 @@ public actor SnapshotService {
             ".\(AppPaths.snapshotFilename).tmp-\(UUID().uuidString)"
         )
 
-        try await database.write { db in
+        // `writeWithoutTransaction`, not `write`: GRDB wraps `write` in a transaction
+        // and SQLite refuses to VACUUM inside one ("cannot VACUUM from within a
+        // transaction"), which made every snapshot fail silently — the error was
+        // swallowed by `runSnapshot`'s best-effort catch, so no backup was ever
+        // produced.
+        try await database.writeWithoutTransaction { db in
             try db.execute(sql: "VACUUM INTO ?", arguments: [tempURL.path])
         }
 

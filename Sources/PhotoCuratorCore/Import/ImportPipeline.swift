@@ -117,8 +117,17 @@ public actor ImportPipeline {
         // is the most reliable signal available without downloading anything.
         // A same-name, same-byte-size *different* photo is not a realistic risk
         // for camera-originated RAW/JPEG output.
+        //
+        // Scoped to the destination library, matching how reconciliation treats
+        // two registered roots (see `ReconciliationService.applyNewFile`): a copy
+        // living under a *different* root is a separate real file with its own row,
+        // so its presence there says nothing about whether this library already has
+        // this shot. Matching globally made importing a card into a second library
+        // silently report every file as "already imported".
         let knownProvisionalKeys = try await database.read { db -> Set<ProvisionalKey> in
-            let all = try Representation.fetchAll(db)
+            let all = try Representation
+                .filter(Representation.Columns.libraryId == targetLibraryId)
+                .fetchAll(db)
             return Set(all.map { ProvisionalKey(filename: $0.filename, fileSize: $0.fileSize, fileMtime: nil) })
         }
 
@@ -237,16 +246,41 @@ public actor ImportPipeline {
                 throw ImportFileError.destinationOccupied
             }
 
-            try fileManager.copyItem(at: file.sourceURL, to: tempURL)
-
-            let sourceHash = try ContentHasher.sha256(ofFileAt: file.sourceURL)
-            let copyHash = try ContentHasher.sha256(ofFileAt: tempURL)
-            guard sourceHash == copyHash else {
-                throw ImportFileError.checksumMismatch
+            // Copy and verify on a dedicated queue: this is blocking file I/O plus
+            // two full passes of SHA-256, and `maxConcurrent` of them running on the
+            // cooperative pool would occupy most of its threads and stall unrelated
+            // `await`s across the app.
+            let sourceURL = file.sourceURL
+            let sourceHash = try await BackgroundWork.run { () throws -> String in
+                // One pass, not two: the source is hashed as its bytes stream into
+                // the copy, instead of copying and then re-reading the whole file
+                // just to digest it. The destination is still read back and hashed
+                // independently — that comparison is the actual copy verification
+                // (spec §7.2), so it has to see what really landed on disk.
+                let hash = try ContentHasher.copy(from: sourceURL, to: tempURL)
+                guard try ContentHasher.sha256(ofFileAt: tempURL) == hash else {
+                    throw ImportFileError.checksumMismatch
+                }
+                return hash
             }
 
-            if try await database.read({ db in try PhotoRepository.findRepresentation(contentHash: sourceHash, in: db) }) != nil {
-                // Byte-identical to a file already in the library under a different
+            // `ContentHasher.copy` writes bytes only — unlike `FileManager.copyItem`
+            // it doesn't carry the source's attributes over, and mtime is what seeds
+            // the provisional capture date below until EXIF derivation backfills the
+            // real one.
+            if let mtime = file.fileMtime {
+                try? fileManager.setAttributes(
+                    [.modificationDate: Date(timeIntervalSince1970: TimeInterval(mtime))],
+                    ofItemAtPath: tempURL.path
+                )
+            }
+
+            // Scoped to the destination library, for the same reason the scan's
+            // provisional-key check above is.
+            if try await database.read({ db in
+                try PhotoRepository.findRepresentation(contentHash: sourceHash, libraryId: targetLibraryId, in: db)
+            }) != nil {
+                // Byte-identical to a file already in this library under a different
                 // name/location — don't duplicate the original on disk either.
                 try? fileManager.removeItem(at: tempURL)
                 return ImportFileOutcome(sourceURL: file.sourceURL, success: true, skippedAsDuplicate: true, errorDescription: nil)

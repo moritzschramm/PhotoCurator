@@ -10,14 +10,22 @@ import PhotoCuratorCore
 @Observable
 final class AlbumScopeStore {
     private(set) var entries: [PhotoGridEntry] = []
-    private var observationTask: Task<Void, Never>?
+    private let observationTask = CancellableTaskBox()
     private var observedAlbumId: Int64?
+
+    /// Without this, the observation task outlives the store: it holds only a `weak
+    /// self`, so nothing keeps the store alive, but nothing cancels the task either —
+    /// GRDB keeps re-running the album's full photo+representation+thumbnail query on
+    /// every database write, forever, with one more leaked observation per album ever
+    /// visited.
+    deinit {
+        observationTask.cancel()
+    }
 
     func start(albumId: Int64, database: AppDatabase) {
         guard observedAlbumId != albumId else { return }
         observedAlbumId = albumId
-        observationTask?.cancel()
-        observationTask = Task { [weak self] in
+        observationTask.replace(with: Task { [weak self] in
             let observation = ValueObservation.tracking { db -> [PhotoGridEntry] in
                 let photos = try AlbumRepository.photos(albumId: albumId, in: db)
                 return try PhotoRepository.attachGridThumbnails(to: photos, db)
@@ -28,11 +36,11 @@ final class AlbumScopeStore {
                     self?.entries = value
                 }
             } catch { }
-        }
+        })
     }
 
     func stop() {
-        observationTask?.cancel()
+        observationTask.cancel()
         observedAlbumId = nil
     }
 }

@@ -1,4 +1,7 @@
 import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 import GRDB
 @testable import PhotoCuratorCore
 
@@ -23,4 +26,28 @@ func makeTempDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+enum TestImageError: Error {
+    case couldNotWrite
+}
+
+/// Writes a real (tiny) JPEG. Derivation goes through ImageIO, which produces neither
+/// a thumbnail nor EXIF for a file of arbitrary bytes — so any test that runs the
+/// derivation pipeline needs a genuine image rather than placeholder `Data`.
+func writeJPEG(to url: URL, gray: CGFloat = 0.5) throws {
+    guard let context = CGContext(
+        data: nil, width: 32, height: 32, bitsPerComponent: 8, bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+    ) else { throw TestImageError.couldNotWrite }
+    context.setFillColor(CGColor(red: gray, green: gray, blue: gray, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+
+    guard let image = context.makeImage(),
+          let destination = CGImageDestinationCreateWithURL(
+              url as CFURL, UTType.jpeg.identifier as CFString, 1, nil
+          )
+    else { throw TestImageError.couldNotWrite }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else { throw TestImageError.couldNotWrite }
 }

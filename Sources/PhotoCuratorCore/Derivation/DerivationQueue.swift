@@ -45,7 +45,17 @@ public actor DerivationQueue {
                     guard let repId = rep.id, let photoRoot = photoRoots[rep.libraryId] else { continue }
                     group.addTask {
                         let url = rep.fileURL(photoRoot: photoRoot)
-                        _ = try? await derivationService.derive(representationId: repId, fileURL: url, kind: rep.kind)
+                        _ = try? await derivationService.derive(
+                            representationId: repId,
+                            fileURL: url,
+                            kind: rep.kind,
+                            // A row that already carries a hash got it from a source
+                            // that read these exact bytes — import's verified copy, or
+                            // a reconcile that recognized the file after a move. Reusing
+                            // it saves reading the whole file a second time purely to
+                            // recompute a digest we already have.
+                            knownContentHash: rep.contentHash
+                        )
                     }
                     return
                 }
