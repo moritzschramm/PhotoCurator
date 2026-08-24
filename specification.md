@@ -8,6 +8,39 @@ whole library.
 This document is a complete build spec. Implement exactly the v1 scope described. Items
 under "Deferred (not v1)" must not be built yet.
 
+## Module layout
+
+Three SwiftPM targets, following spec §10:
+
+- **`PhotoCuratorCore`** — everything except UI. No SwiftUI/AppKit dependency other
+  than `CoreImage`/`ImageIO` for rendering, so it stays independently testable.
+  - `Data/` — GRDB records (`Models/`), `Repositories/` (plain functions over an open
+    `Database`, no threading concerns of their own), `AppMigrations`, `AppDatabase`
+    (owns the `DatabasePool`), `SnapshotService` (`VACUUM INTO` backups).
+  - `Identity/` — provisional key (filename+size+mtime) and `CryptoKit` content hashing.
+  - `Storage/` — security-scoped bookmarks, directory enumeration, online-only detection.
+  - `Reconcile/` — `ReconciliationPlanner` (pure diff, no I/O — see tests) and
+    `ReconciliationService` (applies the plan transactionally).
+  - `Import/` — SD volume detection, the copy→verify→derive→place pipeline.
+  - `Derivation/` — thumbnail (ImageIO) and EXIF extraction, plus the queue that runs
+    them immediately for local files / lazily on first view for online-only ones.
+  - `Rendering/` — the `CIRAWFilter` wrapper.
+  - `Export/`, `Lifecycle/` — publish pipeline, lifecycle transition helpers.
+- **`PhotoCuratorUI`** — SwiftUI shell + the AppKit `NSCollectionView` grid
+  (`Grid/PhotoGridViewController.swift`), wrapped for SwiftUI via
+  `NSViewControllerRepresentable`. `AppEnvironment` (`@Observable`) wires the Core
+  services together and is the one piece of app-wide state, injected via
+  `.environment(_:)`.
+- **`PhotoCuratorApp`** — thin executable target: `@main` App struct +
+  `AppDelegate` (owns `AppEnvironment`, hooks quit-time snapshot via the
+  `.terminateLater` pattern).
+
+`Tests/PhotoCuratorCoreTests` covers migrations (schema, FK cascades, unique
+constraints), identity (content hashing against direct CryptoKit computation,
+provisional-key equality), the reconciliation diff in isolation, and an
+integration suite that runs `ReconciliationService` against real files in a temp
+directory (new/unchanged/moved/removed, idempotency).
+
 ## 1. Platform, language, and toolchain
 
 - **Target:** macOS only. Deployment target macOS 14 (Sonoma) or later.
